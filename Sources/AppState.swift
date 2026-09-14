@@ -22,6 +22,7 @@ struct PrecomputedMacro {
 
 enum SettingsTab: String, CaseIterable, Identifiable {
     case general
+    case languages
     case prompts
     case macros
     case runLog
@@ -38,6 +39,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .general: return "General"
+        case .languages: return "Languages"
         case .prompts: return "Prompts"
         case .macros: return "Voice Macros"
         case .runLog: return "Run Log"
@@ -48,6 +50,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .general: return "gearshape"
+        case .languages: return "globe"
         case .prompts: return "text.bubble"
         case .macros: return "music.mic"
         case .runLog: return "clock.arrow.circlepath"
@@ -248,7 +251,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
     static let defaultContextScreenshotMaxDimension = Int(AppContextService.defaultScreenshotMaxDimension)
     static let contextScreenshotDimensionOptions = [1024, 768, 640, 512]
     static let defaultTranscriptionModel = "whisper-large-v3"
-    static let transcriptionLanguageOptions: [(code: String, name: String)] = LanguageProfiles.supportedInputLanguages
     static let defaultPostProcessingModel = "openai/gpt-oss-20b"
     static let defaultPostProcessingFallbackModel = "qwen/qwen3.6-27b"
     static let defaultContextModel = "qwen/qwen3.6-27b"
@@ -587,7 +589,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     let hotkeyManager = HotkeyManager()
     let overlayManager = RecordingOverlayManager()
     let localParakeetModelManager = LocalParakeetModelManager()
-    private var languageProfileCatalog: LanguageProfileCatalog
+    @Published private(set) var languageProfileCatalog: LanguageProfileCatalog
     private let languageProfileCredentialStore: LanguageProfileCredentialStore
     private var accessibilityTimer: Timer?
     private var audioLevelCancellable: AnyCancellable?
@@ -1082,6 +1084,192 @@ final class AppState: ObservableObject, @unchecked Sendable {
         languageProfileCatalog.resolvedActiveProfile(
             globalDefaults: currentLanguageProfileGlobalDefaults(),
             credentials: languageProfileCredentialStore
+        )
+    }
+
+    // MARK: Language Profile management
+
+    /// Snapshot of the global values the Languages settings editor and
+    /// its per-profile prompt test need to render inheritance and run
+    /// cleanup against. Exposed so the SwiftUI view does not reach into
+    /// `private` resolver helpers.
+    func currentLanguageProfileGlobalDefaultsSnapshot() -> LanguageProfileGlobalDefaults {
+        currentLanguageProfileGlobalDefaults()
+    }
+
+    /// Add a new Language Profile. On success the catalog is updated,
+    /// persisted, and the new profile becomes the Active Profile; the
+    /// returned `LanguageProfileValidationError` carries the user
+    /// message for inline UI feedback on rejection.
+    @discardableResult
+    func addLanguageProfile(
+        name: String,
+        inputLanguageCode: String
+    ) -> LanguageProfileValidationError? {
+        let result = LanguageProfiles.addProfile(
+            name: name,
+            inputLanguageCode: inputLanguageCode,
+            to: languageProfileCatalog
+        )
+        switch result {
+        case .success(let payload):
+            languageProfileCatalog = payload.catalog
+            persistLanguageProfiles(payload.catalog)
+            return nil
+        case .failure(let error):
+            return error
+        }
+    }
+
+    /// Rename an existing Language Profile.
+    @discardableResult
+    func renameLanguageProfile(
+        id: UUID,
+        newName: String
+    ) -> LanguageProfileValidationError? {
+        let result = LanguageProfiles.renameProfile(
+            in: languageProfileCatalog,
+            id: id,
+            newName: newName
+        )
+        switch result {
+        case .success(let newCatalog):
+            languageProfileCatalog = newCatalog
+            persistLanguageProfiles(newCatalog)
+            return nil
+        case .failure(let error):
+            return error
+        }
+    }
+
+    /// Move an existing Language Profile up or down within the ordered
+    /// catalog. Rejected at bounds so the UI can show inline feedback.
+    @discardableResult
+    func reorderLanguageProfile(
+        id: UUID,
+        direction: LanguageProfileReorderDirection
+    ) -> LanguageProfileValidationError? {
+        let result = LanguageProfiles.reorderProfile(
+            in: languageProfileCatalog,
+            id: id,
+            direction: direction
+        )
+        switch result {
+        case .success(let newCatalog):
+            languageProfileCatalog = newCatalog
+            persistLanguageProfiles(newCatalog)
+            return nil
+        case .failure(let error):
+            return error
+        }
+    }
+
+    /// Delete a Language Profile. Refuses to delete the final profile.
+    /// When deleting the Active Profile, the new active is selected
+    /// according to configured order and the deleted profile's stored
+    /// credential override is removed.
+    @discardableResult
+    func deleteLanguageProfile(id: UUID) -> LanguageProfileValidationError? {
+        let result = LanguageProfiles.deleteProfile(
+            from: languageProfileCatalog,
+            id: id,
+            credentials: languageProfileCredentialStore
+        )
+        switch result {
+        case .success(let newCatalog):
+            languageProfileCatalog = newCatalog
+            persistLanguageProfiles(newCatalog)
+            return nil
+        case .failure(let error):
+            return error
+        }
+    }
+
+    /// Select a Language Profile as the Active Profile for the next
+    /// Processing Attempt. Settings edits remain available during a
+    /// Processing Attempt; the immutable snapshot at attempt-start
+    /// guarantees the change applies only to the next attempt.
+    @discardableResult
+    func selectLanguageProfile(id: UUID) -> LanguageProfileValidationError? {
+        let result = LanguageProfiles.selectProfile(
+            in: languageProfileCatalog,
+            id: id
+        )
+        switch result {
+        case .success(let newCatalog):
+            languageProfileCatalog = newCatalog
+            persistLanguageProfiles(newCatalog)
+            return nil
+        case .failure(let error):
+            return error
+        }
+    }
+
+    /// Replace an existing profile's persisted fields (name, input
+    /// language code, and the four non-secret override strings) using
+    /// the supplied updated profile. The supplied profile must keep
+    /// its existing `id`; override strings are trimmed and empty
+    /// values mean "inherit from global". Validation re-applies the
+    /// catalog invariants.
+    @discardableResult
+    func updateLanguageProfile(
+        with updatedProfile: LanguageProfile
+    ) -> LanguageProfileValidationError? {
+        let result = LanguageProfiles.updateProfile(
+            in: languageProfileCatalog,
+            with: updatedProfile
+        )
+        switch result {
+        case .success(let newCatalog):
+            languageProfileCatalog = newCatalog
+            persistLanguageProfiles(newCatalog)
+            return nil
+        case .failure(let error):
+            return error
+        }
+    }
+
+    /// Persist a non-empty API-key override for one Language Profile
+    /// through the injected protected credential store.
+    func setLanguageProfileAPIKeyOverride(
+        _ value: String,
+        forProfileID profileID: UUID
+    ) {
+        LanguageProfiles.setAPIKeyOverride(
+            value,
+            for: profileID,
+            credentials: languageProfileCredentialStore
+        )
+    }
+
+    /// Clear the stored API-key override for one Language Profile.
+    func clearLanguageProfileAPIKeyOverride(forProfileID profileID: UUID) {
+        LanguageProfiles.clearAPIKeyOverride(
+            for: profileID,
+            credentials: languageProfileCredentialStore
+        )
+    }
+
+    /// Whether a credential override is stored for the given profile.
+    /// Boolean only — the credential value never surfaces through this
+    /// API. Routes through the injected `languageProfileCredentialStore`
+    /// so the editor UI never needs to construct the store directly.
+    func hasLanguageProfileAPIKeyOverride(profileID: UUID) -> Bool {
+        languageProfileCredentialStore.loadAPIKeyOverride(profileID: profileID) != nil
+    }
+
+    /// The profile whose prompt the editor's "Test" button would run.
+    /// Exposed so the SwiftUI editor can show which prompt is being
+    /// tested and so the effective cleanup prompt can be computed
+    /// without going through the full resolver path.
+    func effectiveCleanupPromptForProfileEditor(
+        profile: LanguageProfile,
+        builtInDefaultPrompt: String
+    ) -> String {
+        LanguageProfiles.effectiveCleanupPrompt(
+            profile: profile,
+            globalDefaults: currentLanguageProfileGlobalDefaults(),
+            builtInDefaultPrompt: builtInDefaultPrompt
         )
     }
 

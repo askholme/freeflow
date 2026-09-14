@@ -263,21 +263,6 @@ struct ProviderSettingsFields: View {
             )
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Transcription Language")
-                    .font(.caption.weight(.semibold))
-                Picker("", selection: $appState.transcriptionLanguage) {
-                    ForEach(AppState.transcriptionLanguageOptions, id: \.code) { option in
-                        Text(option.name).tag(option.code)
-                    }
-                }
-                .accessibilityLabel("Transcription Language")
-                .labelsHidden()
-                Text("Hint to the transcription model. Auto-detect works for most users. Pick a specific language if you see wrong-script characters (for example Chinese) appear in your output.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
                 Text("Transcription API URL")
                     .font(.caption.weight(.semibold))
                 HStack(spacing: 8) {
@@ -446,6 +431,8 @@ struct SettingsView: View {
                 switch appState.selectedSettingsTab {
                 case .general, .none:
                     GeneralSettingsView()
+                case .languages:
+                    LanguagesSettingsView()
                 case .prompts:
                     PromptsSettingsView()
                 case .macros:
@@ -1536,6 +1523,785 @@ struct MicrophoneOptionRow: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Languages Settings
+
+/// Languages settings tab. Lets users add, rename, reorder, delete,
+/// select, and configure per-profile overrides for Language Profiles,
+/// and run a profile-scoped cleanup prompt test that does not mutate
+/// the existing global prompt test in `PromptsSettingsView`.
+struct LanguagesSettingsView: View {
+    @EnvironmentObject var appState: AppState
+
+    /// The profile currently shown in the editor below the list. Nil
+    /// when no profile exists yet (only possible transiently before the
+    /// seeded Default profile loads, but kept for clarity).
+    @State private var selectedProfileID: UUID?
+
+    // Add-profile flow
+    // `addLanguageCode` is `String?` so `nil` means "no language chosen
+    // yet" while `""` remains a legitimate Auto-detect choice — the
+    // Picker cannot use a single non-optional `String` to distinguish
+    // those two states because they share the same code.
+    @State private var addLanguageCode: String? = nil
+    @State private var addName: String = ""
+    @State private var addError: String?
+
+    // Rename flow (alert-style inline)
+    @State private var renamingProfileID: UUID?
+    @State private var renameDraft: String = ""
+    @State private var renameError: String?
+    @State private var listError: String?
+
+    // Editor draft state for the currently selected profile.
+    @State private var editorURLDraft: String = ""
+    @State private var editorUploadModelDraft: String = ""
+    @State private var editorRealtimeModelDraft: String = ""
+    @State private var editorPromptDraft: String = ""
+    @State private var editorAPIKeyDraft: String = ""
+    @State private var hasStoredAPIKeyOverride: Bool = false
+    @State private var editorError: String?
+
+    @FocusState private var addNameFocused: Bool
+    @FocusState private var renameFocused: Bool
+    @FocusState private var editorURLFocused: Bool
+    @FocusState private var editorAPIKeyFocused: Bool
+    @FocusState private var editorUploadModelFocused: Bool
+    @FocusState private var editorRealtimeModelFocused: Bool
+    @FocusState private var editorPromptFocused: Bool
+
+    // Profile-scoped prompt test state. Reuses the same patterns as
+    // the global prompt test in `PromptsSettingsView` so the UI is
+    // consistent, but never mutates that view or its state.
+    @State private var profileTestInput: String = "Um, so I was like, thinking we should uh, refactor the authentication module, you know?"
+    @State private var profileTestRunning: Bool = false
+    @State private var profileTestOutput: String?
+    @State private var profileTestError: String?
+    @State private var profileTestPrompt: String?
+
+    private var profiles: [LanguageProfile] {
+        appState.languageProfileCatalog.profiles
+    }
+
+    private var activeProfileID: UUID {
+        appState.languageProfileCatalog.activeProfileID
+    }
+
+    private var selectedProfile: LanguageProfile? {
+        guard let id = selectedProfileID else { return nil }
+        return profiles.first(where: { $0.id == id })
+    }
+
+    private var unconfiguredLanguages: [(code: String, name: String)] {
+        let configured = Set(profiles.map(\.inputLanguageCode))
+        return LanguageProfiles.supportedInputLanguages.filter { lang in
+            !configured.contains(lang.code)
+        }
+    }
+
+    private var isProcessingAttemptInFlight: Bool {
+        appState.isRecording || appState.isTranscribing
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                Text("Languages")
+                    .font(.largeTitle.bold())
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if isProcessingAttemptInFlight {
+                    nextAttemptBanner
+                }
+
+                SettingsCard("Language Profiles", icon: "globe") {
+                    profileListSection
+                }
+
+                if let profile = selectedProfile {
+                    SettingsCard("Edit Profile", icon: "pencil") {
+                        editorSection(profile: profile)
+                    }
+                }
+            }
+            .padding(24)
+        }
+        .onAppear {
+            ensureSelection()
+            seedEditorDraftIfNeeded()
+        }
+        .onChange(of: appState.languageProfileCatalog) { _ in
+            ensureSelection()
+            seedEditorDraftIfNeeded()
+        }
+    }
+
+    private var nextAttemptBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "info.circle.fill")
+                .foregroundStyle(.blue)
+            Text("A recording or transcription is in progress. Changes apply to the next attempt.")
+                .font(.caption)
+            Spacer()
+        }
+        .padding(10)
+        .background(Color.blue.opacity(0.08))
+        .cornerRadius(6)
+    }
+
+    // MARK: Profile list section
+
+    private var profileListSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let listError {
+                Label(listError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            ForEach(Array(profiles.enumerated()), id: \.element.id) { index, profile in
+                profileRow(profile: profile, index: index)
+            }
+
+            Divider()
+
+            addProfileSection
+        }
+    }
+
+    private func profileRow(profile: LanguageProfile, index: Int) -> some View {
+        let isActive = profile.id == activeProfileID
+        let isSelected = profile.id == selectedProfileID
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(profile.name)
+                    .font(.body.weight(.semibold))
+                Text(languageDisplayName(for: profile))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if isActive {
+                    Text("Active")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.18))
+                        .cornerRadius(4)
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 6) {
+                Button {
+                    if let err = appState.selectLanguageProfile(id: profile.id) {
+                        listError = err.message
+                    } else {
+                        listError = nil
+                    }
+                } label: {
+                    Label("Select", systemImage: "checkmark.circle")
+                        .font(.caption)
+                }
+                .disabled(isActive)
+
+                Button {
+                    renamingProfileID = profile.id
+                    renameDraft = profile.name
+                    renameError = nil
+                    // Selecting the row on first click ensures the
+                    // inline rename field (which only renders inside
+                    // the selected row) appears immediately, without
+                    // a second tap.
+                    selectedProfileID = profile.id
+                    seedEditorDraftIfNeeded()
+                } label: {
+                    Label("Rename", systemImage: "pencil")
+                        .font(.caption)
+                }
+
+                Button {
+                    if let err = appState.reorderLanguageProfile(
+                        id: profile.id,
+                        direction: .up
+                    ) {
+                        listError = err.message
+                    } else {
+                        listError = nil
+                    }
+                } label: {
+                    Image(systemName: "arrow.up")
+                        .font(.caption)
+                }
+                .disabled(index == 0)
+                .help("Move up")
+
+                Button {
+                    if let err = appState.reorderLanguageProfile(
+                        id: profile.id,
+                        direction: .down
+                    ) {
+                        listError = err.message
+                    } else {
+                        listError = nil
+                    }
+                } label: {
+                    Image(systemName: "arrow.down")
+                        .font(.caption)
+                }
+                .disabled(index == profiles.count - 1)
+                .help("Move down")
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    if let err = appState.deleteLanguageProfile(id: profile.id) {
+                        listError = err.message
+                    } else {
+                        listError = nil
+                    }
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                        .font(.caption)
+                }
+            }
+
+            if isSelected, renamingProfileID == profile.id {
+                renameRow(profile: profile)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(isSelected ? Color.accentColor.opacity(0.06) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(isSelected ? Color.accentColor.opacity(0.25) : Color.clear, lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            selectedProfileID = profile.id
+            seedEditorDraftIfNeeded()
+        }
+    }
+
+    private func renameRow(profile: LanguageProfile) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                TextField("Profile name", text: $renameDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($renameFocused)
+                    .onSubmit {
+                        commitRename(profile: profile)
+                    }
+                Button("Save") {
+                    commitRename(profile: profile)
+                }
+                .font(.caption)
+                Button("Cancel") {
+                    renamingProfileID = nil
+                    renameDraft = ""
+                    renameError = nil
+                }
+                .font(.caption)
+            }
+            if let renameError {
+                Label(renameError, systemImage: "xmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .onAppear {
+            // Mirror the focus-on-appear pattern used elsewhere in this
+            // file. Dispatching to the next runloop tick avoids a SwiftUI
+            // warning about mutating state during a view update.
+            DispatchQueue.main.async {
+                renameFocused = true
+            }
+        }
+    }
+
+    private func commitRename(profile: LanguageProfile) {
+        if let err = appState.renameLanguageProfile(id: profile.id, newName: renameDraft) {
+            renameError = err.message
+        } else {
+            renamingProfileID = nil
+            renameDraft = ""
+            renameError = nil
+        }
+    }
+
+    // MARK: Add-profile section
+
+    private var addProfileSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Add Language Profile")
+                .font(.caption.weight(.semibold))
+
+            if unconfiguredLanguages.isEmpty {
+                Text("All supported languages are already configured.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 8) {
+                    Picker("Language", selection: $addLanguageCode) {
+                        Text("Select language").tag(nil as String?)
+                        ForEach(unconfiguredLanguages, id: \.code) { lang in
+                            Text(lang.name).tag(lang.code as String?)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 220)
+
+                    TextField("Profile name", text: $addName)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($addNameFocused)
+                        .onSubmit {
+                            commitAdd()
+                        }
+
+                    Button {
+                        commitAdd()
+                    } label: {
+                        Label("Add", systemImage: "plus")
+                            .font(.caption)
+                    }
+                    .disabled(addLanguageCode == nil || addName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+
+                if let addError {
+                    Label(addError, systemImage: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+    }
+
+    private func commitAdd() {
+        let trimmedName = addName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let code = addLanguageCode, !trimmedName.isEmpty else {
+            return
+        }
+        if let err = appState.addLanguageProfile(
+            name: trimmedName,
+            inputLanguageCode: code
+        ) {
+            addError = err.message
+            return
+        }
+        // Newly added profiles become the Active Profile. Select it in
+        // the editor and reset the add form for the next entry.
+        if let last = appState.languageProfileCatalog.profiles.last {
+            selectedProfileID = last.id
+        }
+        addLanguageCode = nil
+        addName = ""
+        addError = nil
+    }
+
+    // MARK: Editor section
+
+    private func editorSection(profile: LanguageProfile) -> some View {
+        let globals = appState.currentLanguageProfileGlobalDefaultsSnapshot()
+        let effectiveURL = LanguageProfiles.effectiveTranscriptionBaseURL(
+            profile: profile,
+            globalDefaults: globals
+        )
+        let effectiveUploadModel = LanguageProfiles.effectiveTranscriptionModel(
+            profile: profile,
+            globalDefaults: globals
+        )
+        let effectiveRealtimeModel = inherit(profile.realtimeModelOverride, globals.realtimeModel)
+        let effectivePrompt = appState.effectiveCleanupPromptForProfileEditor(
+            profile: profile,
+            builtInDefaultPrompt: PostProcessingService.defaultSystemPrompt
+        )
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(profile.name)
+                    .font(.headline)
+                Text(languageDisplayName(for: profile))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+
+            if let editorError {
+                Label(editorError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            Group {
+                overrideField(
+                    title: "Transcription URL",
+                    placeholder: "Inherits: \(effectiveURL.isEmpty ? "(global not set)" : effectiveURL)",
+                    draft: $editorURLDraft,
+                    focused: $editorURLFocused,
+                    onCommit: { commitOverrides(profile: profile) },
+                    onClear: {
+                        editorURLDraft = ""
+                        commitOverrides(profile: profile)
+                    },
+                    isInherited: editorURLDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    monospaced: true
+                )
+
+                overrideField(
+                    title: "API Key",
+                    placeholder: hasStoredAPIKeyOverride
+                        ? "Override set (cleared to inherit global)"
+                        : "Inherits global API key",
+                    draft: $editorAPIKeyDraft,
+                    focused: $editorAPIKeyFocused,
+                    onCommit: { commitAPIKey(profile: profile) },
+                    onClear: {
+                        editorAPIKeyDraft = ""
+                        appState.clearLanguageProfileAPIKeyOverride(forProfileID: profile.id)
+                        hasStoredAPIKeyOverride = false
+                    },
+                    isInherited: !hasStoredAPIKeyOverride,
+                    monospaced: true,
+                    secure: true
+                )
+
+                overrideField(
+                    title: "Upload Transcription Model",
+                    placeholder: "Inherits: \(effectiveUploadModel.isEmpty ? "(global not set)" : effectiveUploadModel)",
+                    draft: $editorUploadModelDraft,
+                    focused: $editorUploadModelFocused,
+                    onCommit: { commitOverrides(profile: profile) },
+                    onClear: {
+                        editorUploadModelDraft = ""
+                        commitOverrides(profile: profile)
+                    },
+                    isInherited: editorUploadModelDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    monospaced: true
+                )
+
+                overrideField(
+                    title: "Realtime Transcription Model",
+                    placeholder: "Inherits: \(effectiveRealtimeModel.isEmpty ? "(global not set)" : effectiveRealtimeModel)",
+                    draft: $editorRealtimeModelDraft,
+                    focused: $editorRealtimeModelFocused,
+                    onCommit: { commitOverrides(profile: profile) },
+                    onClear: {
+                        editorRealtimeModelDraft = ""
+                        commitOverrides(profile: profile)
+                    },
+                    isInherited: editorRealtimeModelDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    monospaced: true
+                )
+
+                Text("Applies only to globally enabled live realtime transcription. It does not affect file transcription and does not enable streaming by itself.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Cleanup Prompt")
+                        .font(.caption.weight(.semibold))
+                    TextEditor(text: $editorPromptDraft)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minHeight: 80, maxHeight: 160)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                        )
+                        .focused($editorPromptFocused)
+                        .onChange(of: editorPromptFocused) { focused in
+                            if !focused {
+                                commitOverrides(profile: profile)
+                            }
+                        }
+                    if editorPromptDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("Inherits the global cleanup prompt (or built-in default when the global prompt is empty).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        if editorPromptDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Label("Inheriting", systemImage: "arrow.down.circle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Label("Custom override", systemImage: "pencil")
+                                .font(.caption)
+                                .foregroundStyle(.blue)
+                        }
+                        Spacer()
+                        if !editorPromptDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Button("Clear") {
+                                editorPromptDraft = ""
+                                commitOverrides(profile: profile)
+                            }
+                            .font(.caption)
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            profilePromptTestSection(
+                profile: profile,
+                effectivePrompt: effectivePrompt
+            )
+        }
+    }
+
+    private func overrideField(
+        title: String,
+        placeholder: String,
+        draft: Binding<String>,
+        focused: FocusState<Bool>.Binding,
+        onCommit: @escaping () -> Void,
+        onClear: @escaping () -> Void,
+        isInherited: Bool,
+        monospaced: Bool,
+        secure: Bool = false
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+            HStack(spacing: 8) {
+                Group {
+                    if secure {
+                        SecureField(placeholder, text: draft)
+                    } else {
+                        TextField(placeholder, text: draft)
+                    }
+                }
+                .textFieldStyle(.roundedBorder)
+                .font(monospaced ? .system(.body, design: .monospaced) : .body)
+                .focused(focused)
+                .onSubmit { onCommit() }
+                .onChange(of: focused.wrappedValue) { isFocused in
+                    if !isFocused { onCommit() }
+                }
+                if !draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button("Clear") { onClear() }
+                        .font(.caption)
+                }
+            }
+            if isInherited {
+                Label("Inheriting", systemImage: "arrow.down.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Label("Custom override", systemImage: "pencil")
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+            }
+        }
+    }
+
+    private func commitOverrides(profile: LanguageProfile) {
+        let updated = LanguageProfile(
+            id: profile.id,
+            name: profile.name,
+            inputLanguageCode: profile.inputLanguageCode,
+            transcriptionURLOverride: editorURLDraft,
+            transcriptionModelOverride: editorUploadModelDraft,
+            realtimeModelOverride: editorRealtimeModelDraft,
+            postProcessingPromptOverride: editorPromptDraft
+        )
+        if let err = appState.updateLanguageProfile(with: updated) {
+            editorError = err.message
+        } else {
+            editorError = nil
+        }
+    }
+
+    private func commitAPIKey(profile: LanguageProfile) {
+        let trimmed = editorAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            // An empty submission does NOT clear the stored override —
+            // the user must press Clear explicitly. Treat as no-op.
+            editorAPIKeyDraft = ""
+            return
+        }
+        appState.setLanguageProfileAPIKeyOverride(trimmed, forProfileID: profile.id)
+        hasStoredAPIKeyOverride = true
+        editorAPIKeyDraft = ""
+    }
+
+    // MARK: Profile prompt test
+
+    private func profilePromptTestSection(
+        profile: LanguageProfile,
+        effectivePrompt: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Test Profile Cleanup Prompt")
+                .font(.caption.weight(.semibold))
+
+            Text("Runs the same cleanup pipeline as the global prompt test but uses this profile's effective cleanup prompt (override → global → built-in default). The global prompt test in the Prompts tab is unchanged.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            TextEditor(text: $profileTestInput)
+                .font(.system(.body, design: .monospaced))
+                .frame(minHeight: 60, maxHeight: 100)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                )
+
+            Button {
+                runProfilePromptTest(profile: profile, effectivePrompt: effectivePrompt)
+            } label: {
+                HStack(spacing: 6) {
+                    if profileTestRunning {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Running...")
+                    } else {
+                        Image(systemName: "play.fill")
+                        Text("Test Profile Prompt")
+                    }
+                }
+            }
+            .disabled(profileTestRunning || appState.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || profileTestInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            if appState.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Label("API key required to test", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            if let profileTestError {
+                Label(profileTestError, systemImage: "xmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            if let profileTestOutput {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Result:")
+                        .font(.caption.weight(.semibold))
+                    Text(profileTestOutput.isEmpty ? "(empty — no output)" : profileTestOutput)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.green.opacity(0.08))
+                        .cornerRadius(6)
+                }
+            }
+
+            if let profileTestPrompt {
+                DisclosureGroup("Full prompt sent") {
+                    Text(profileTestPrompt)
+                        .font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func runProfilePromptTest(
+        profile: LanguageProfile,
+        effectivePrompt: String
+    ) {
+        profileTestRunning = true
+        profileTestOutput = nil
+        profileTestError = nil
+        profileTestPrompt = nil
+
+        // Mirror the credential boundary used by the global prompt
+        // test in `runSystemPromptTest()`: the LLM cleanup provider
+        // must receive the global API key, never a profile-specific
+        // transcription credential. The only profile-specific input
+        // here is the effective cleanup prompt.
+        let service = PostProcessingService(
+            apiKey: appState.apiKey,
+            baseURL: appState.apiBaseURL,
+            preferredModel: appState.postProcessingModel,
+            preferredFallbackModel: appState.postProcessingFallbackModel,
+            instructionExecutionGuardEnabled: appState.instructionExecutionGuardEnabled
+        )
+
+        let input = profileTestInput
+        let prompt = effectivePrompt
+        let vocabulary = appState.customVocabulary
+
+        let context = AppContext(
+            appName: "\(AppName.displayName) Settings",
+            bundleIdentifier: "com.zachlatta.freeflow",
+            windowTitle: "Languages Profile Prompt Test",
+            selectedText: nil,
+            currentActivity: "User is testing the cleanup prompt of a Language Profile in \(AppName.displayName) settings.",
+            contextSystemPrompt: nil,
+            contextPrompt: nil,
+            screenshotDataURL: nil,
+            screenshotMimeType: nil,
+            screenshotError: nil
+        )
+
+        Task {
+            do {
+                let result = try await service.postProcess(
+                    transcript: input,
+                    context: context,
+                    customVocabulary: vocabulary,
+                    customSystemPrompt: prompt
+                )
+                await MainActor.run {
+                    profileTestOutput = result.transcript
+                    profileTestPrompt = result.prompt
+                    profileTestRunning = false
+                }
+            } catch {
+                await MainActor.run {
+                    profileTestError = error.localizedDescription
+                    profileTestRunning = false
+                }
+            }
+        }
+    }
+
+    // MARK: Helpers
+
+    private func ensureSelection() {
+        if selectedProfileID == nil || !profiles.contains(where: { $0.id == selectedProfileID }) {
+            selectedProfileID = profiles.first?.id
+        }
+    }
+
+    private func seedEditorDraftIfNeeded() {
+        guard let profile = selectedProfile else { return }
+        editorURLDraft = profile.transcriptionURLOverride
+        editorUploadModelDraft = profile.transcriptionModelOverride
+        editorRealtimeModelDraft = profile.realtimeModelOverride
+        editorPromptDraft = profile.postProcessingPromptOverride
+        editorAPIKeyDraft = ""
+        // The credential store is the source of truth for whether an
+        // override exists; we never surface the value in the UI. The
+        // query is routed through `AppState` so the view does not need
+        // to construct the production store directly.
+        hasStoredAPIKeyOverride = appState.hasLanguageProfileAPIKeyOverride(profileID: profile.id)
+    }
+
+    private func inherit(_ override: String, _ global: String) -> String {
+        let trimmed = override.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return global.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func languageDisplayName(for profile: LanguageProfile) -> String {
+        if profile.inputLanguageCode.isEmpty {
+            return "Auto-detect"
+        }
+        if let entry = LanguageProfiles.supportedInputLanguages.first(where: { $0.code == profile.inputLanguageCode }) {
+            return entry.name
+        }
+        return profile.inputLanguageCode
     }
 }
 

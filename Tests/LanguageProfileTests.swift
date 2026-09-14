@@ -20,17 +20,18 @@ enum LanguageProfileTests {
             self.values = values
         }
 
-        func setOverride(_ value: String?, for profileID: UUID) {
-            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if trimmed.isEmpty {
-                values.removeValue(forKey: profileID)
-            } else {
-                values[profileID] = trimmed
-            }
-        }
-
         func loadAPIKeyOverride(profileID: UUID) -> String? {
             values[profileID]
+        }
+
+        func setAPIKeyOverride(_ value: String, profileID: UUID) {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            values[profileID] = trimmed
+        }
+
+        func clearAPIKeyOverride(profileID: UUID) {
+            values.removeValue(forKey: profileID)
         }
     }
 
@@ -52,6 +53,38 @@ enum LanguageProfileTests {
         testPromptScopeFallsBackToGlobalCustomPrompt()
         testTranslationIndependence()
         testSnapshotImmutability()
+        testAddProfileSuccessAndBecomesActive()
+        testAddProfileRejectsEmptyName()
+        testAddProfileRejectsUnsupportedCode()
+        testAddProfileRejectsDuplicateName()
+        testAddProfileRejectsDuplicateLanguageCode()
+        testAddProfileRejectsSecondAutoDetect()
+        testAddProfileDanishCodePath()
+        testRenameProfileSuccessAndTrims()
+        testRenameProfileRejectsEmptyName()
+        testRenameProfileRejectsDuplicateName()
+        testRenameProfileRejectsUnknownID()
+        testRenameProfileSameNameIsNoOp()
+        testReorderProfileMovesUpAndDown()
+        testReorderProfileRejectsTopUp()
+        testReorderProfileRejectsBottomDown()
+        testReorderProfileRejectsUnknownID()
+        testDeleteProfileRejectsFinalProfile()
+        testDeleteProfileRejectsUnknownID()
+        testDeleteProfileRemovesCredentialOverride()
+        testDeleteActiveProfileSelectsSuccessorInOrder()
+        testDeleteLastProfileSelectsLastRemaining()
+        testSelectProfileSuccess()
+        testSelectProfileRejectsUnknownID()
+        testUpdateProfileOverridesTrimsAndPersists()
+        testUpdateProfileRejectsDuplicateName()
+        testUpdateProfileRejectsDuplicateLanguageCode()
+        testSetAPIKeyOverridePersistsThroughStore()
+        testClearAPIKeyOverrideRemovesFromStore()
+        testEffectiveCleanupPromptUsesProfileOverride()
+        testEffectiveCleanupPromptFallsBackToGlobal()
+        testEffectiveCleanupPromptFallsBackToBuiltIn()
+        testEffectiveTranscriptionValuesFollowOverrideRules()
     }
 
     // MARK: - Encoding
@@ -523,7 +556,7 @@ enum LanguageProfileTests {
         )
         TestSupport.expectEqual(inherited.transcriptionAPIKey, "global-key")
 
-        store.setOverride("  profile-key  ", for: profileID)
+        store.setAPIKeyOverride("  profile-key  ", profileID: profileID)
         let overridden = LanguageProfiles.resolve(
             profile: profile,
             globalDefaults: globals,
@@ -531,7 +564,7 @@ enum LanguageProfileTests {
         )
         TestSupport.expectEqual(overridden.transcriptionAPIKey, "profile-key")
 
-        store.setOverride("   ", for: profileID)
+        store.clearAPIKeyOverride(profileID: profileID)
         let emptyOverride = LanguageProfiles.resolve(
             profile: profile,
             globalDefaults: globals,
@@ -777,7 +810,7 @@ enum LanguageProfileTests {
         globals.transcriptionModel = "global-model-2"
         globals.realtimeModel = "global-realtime-2"
         globals.customSystemPrompt = ""
-        store.setOverride("profile-key-2", for: profileID)
+        store.setAPIKeyOverride("profile-key-2", profileID: profileID)
 
         // ResolvedLanguageProfile stores String/UUID/String? — all value
         // types — so every field on `snapshot` is a copy of the original
@@ -792,5 +825,814 @@ enum LanguageProfileTests {
         TestSupport.expectEqual(snapshot.transcriptionModel, frozen.transcriptionModel)
         TestSupport.expectEqual(snapshot.realtimeModel, frozen.realtimeModel)
         TestSupport.expectEqual(snapshot.ordinaryCleanupSystemPrompt, frozen.ordinaryCleanupSystemPrompt)
+    }
+
+    // MARK: - Add profile
+
+    private static func testAddProfileSuccessAndBecomesActive() {
+        let englishID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: englishID,
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: englishID
+        )
+        switch LanguageProfiles.addProfile(
+            name: "  Danish  ",
+            inputLanguageCode: "da",
+            to: catalog
+        ) {
+        case .success(let payload):
+            TestSupport.expectEqual(payload.catalog.profiles.count, 2)
+            TestSupport.expectEqual(payload.catalog.profiles.last?.name, "Danish")
+            TestSupport.expectEqual(payload.catalog.profiles.last?.inputLanguageCode, "da")
+            TestSupport.expectEqual(payload.catalog.activeProfileID, payload.profile.id)
+            TestSupport.expectEqual(payload.profile.transcriptionURLOverride, "")
+            TestSupport.expectEqual(payload.profile.transcriptionModelOverride, "")
+            TestSupport.expectEqual(payload.profile.realtimeModelOverride, "")
+            TestSupport.expectEqual(payload.profile.postProcessingPromptOverride, "")
+        case .failure(let error):
+            fatalError("Expected add success, got \(error.message)")
+        }
+    }
+
+    private static func testAddProfileRejectsEmptyName() {
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: UUID(),
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: UUID()
+        )
+        switch LanguageProfiles.addProfile(name: "   ", inputLanguageCode: "da", to: catalog) {
+        case .success:
+            fatalError("Expected empty-name rejection")
+        case .failure(.emptyName):
+            break
+        case .failure(let other):
+            fatalError("Expected .emptyName, got \(other)")
+        }
+    }
+
+    private static func testAddProfileRejectsUnsupportedCode() {
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: UUID(),
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: UUID()
+        )
+        switch LanguageProfiles.addProfile(name: "Klingon", inputLanguageCode: "tlh", to: catalog) {
+        case .success:
+            fatalError("Expected unsupported-code rejection")
+        case .failure(.unsupportedLanguageCode):
+            break
+        case .failure(let other):
+            fatalError("Expected .unsupportedLanguageCode, got \(other)")
+        }
+    }
+
+    private static func testAddProfileRejectsDuplicateName() {
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: UUID(),
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: UUID()
+        )
+        switch LanguageProfiles.addProfile(name: "english", inputLanguageCode: "da", to: catalog) {
+        case .success:
+            fatalError("Expected duplicate-name rejection")
+        case .failure(.duplicateName):
+            break
+        case .failure(let other):
+            fatalError("Expected .duplicateName, got \(other)")
+        }
+    }
+
+    private static func testAddProfileRejectsDuplicateLanguageCode() {
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: UUID(),
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: UUID()
+        )
+        switch LanguageProfiles.addProfile(name: "British", inputLanguageCode: "en", to: catalog) {
+        case .success:
+            fatalError("Expected duplicate-code rejection")
+        case .failure(.duplicateLanguageCode):
+            break
+        case .failure(let other):
+            fatalError("Expected .duplicateLanguageCode, got \(other)")
+        }
+    }
+
+    private static func testAddProfileRejectsSecondAutoDetect() {
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: UUID(),
+                    name: "Auto",
+                    inputLanguageCode: "",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: UUID()
+        )
+        switch LanguageProfiles.addProfile(name: "Auto Too", inputLanguageCode: "", to: catalog) {
+        case .success:
+            fatalError("Expected second Auto-detect rejection")
+        case .failure(.duplicateLanguageCode):
+            break
+        case .failure(let other):
+            fatalError("Expected .duplicateLanguageCode, got \(other)")
+        }
+    }
+
+    private static func testAddProfileDanishCodePath() {
+        // Danish is the explicit per-story language code in the
+        // specification. Pin the supported-language entry so a future
+        // accidental rename or removal of Danish fails fast.
+        let danish = LanguageProfiles.supportedInputLanguages.first(where: { $0.code == "da" })
+        TestSupport.expectEqual(danish?.name, "Danish")
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: UUID(),
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: UUID()
+        )
+        switch LanguageProfiles.addProfile(name: "Danish", inputLanguageCode: "da", to: catalog) {
+        case .success(let payload):
+            TestSupport.expectEqual(payload.profile.inputLanguageCode, "da")
+        case .failure(let error):
+            fatalError("Expected Danish add success, got \(error.message)")
+        }
+    }
+
+    // MARK: - Rename profile
+
+    private static func testRenameProfileSuccessAndTrims() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: id,
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: id
+        )
+        switch LanguageProfiles.renameProfile(in: catalog, id: id, newName: "  American English  ") {
+        case .success(let newCatalog):
+            TestSupport.expectEqual(newCatalog.profiles[0].name, "American English")
+            TestSupport.expectEqual(newCatalog.activeProfileID, id)
+        case .failure(let error):
+            fatalError("Expected rename success, got \(error.message)")
+        }
+    }
+
+    private static func testRenameProfileRejectsEmptyName() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: id,
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: id
+        )
+        switch LanguageProfiles.renameProfile(in: catalog, id: id, newName: "   ") {
+        case .success:
+            fatalError("Expected empty-name rejection")
+        case .failure(.emptyName):
+            break
+        case .failure(let other):
+            fatalError("Expected .emptyName, got \(other)")
+        }
+    }
+
+    private static func testRenameProfileRejectsDuplicateName() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: firstID,
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                ),
+                LanguageProfile(
+                    id: secondID,
+                    name: "Danish",
+                    inputLanguageCode: "da",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: firstID
+        )
+        switch LanguageProfiles.renameProfile(in: catalog, id: secondID, newName: "ENGLISH") {
+        case .success:
+            fatalError("Expected duplicate-name rejection")
+        case .failure(.duplicateName):
+            break
+        case .failure(let other):
+            fatalError("Expected .duplicateName, got \(other)")
+        }
+    }
+
+    private static func testRenameProfileRejectsUnknownID() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: id,
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: id
+        )
+        let bogus = UUID()
+        switch LanguageProfiles.renameProfile(in: catalog, id: bogus, newName: "X") {
+        case .success:
+            fatalError("Expected unknown-ID rejection")
+        case .failure(.unknownProfileID(let returned)):
+            TestSupport.expectEqual(returned, bogus)
+        case .failure(let other):
+            fatalError("Expected .unknownProfileID, got \(other)")
+        }
+    }
+
+    private static func testRenameProfileSameNameIsNoOp() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(
+                    id: id,
+                    name: "English",
+                    inputLanguageCode: "en",
+                    transcriptionURLOverride: "",
+                    transcriptionModelOverride: "",
+                    realtimeModelOverride: "",
+                    postProcessingPromptOverride: ""
+                )
+            ],
+            activeProfileID: id
+        )
+        switch LanguageProfiles.renameProfile(in: catalog, id: id, newName: "English") {
+        case .success(let newCatalog):
+            TestSupport.expectEqual(newCatalog, catalog)
+        case .failure(let error):
+            fatalError("Expected no-op rename success, got \(error.message)")
+        }
+    }
+
+    // MARK: - Reorder profile
+
+    private static func testReorderProfileMovesUpAndDown() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let thirdID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: firstID, name: "A", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: secondID, name: "B", inputLanguageCode: "da", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: thirdID, name: "C", inputLanguageCode: "fr", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: firstID
+        )
+
+        // Move the third profile up by one (C → index 1).
+        let upOne = LanguageProfiles.reorderProfile(in: catalog, id: thirdID, direction: .up)
+        switch upOne {
+        case .success(let newCatalog):
+            TestSupport.expectEqual(newCatalog.profiles.map(\.id), [firstID, thirdID, secondID])
+        case .failure(let error):
+            fatalError("Expected up reorder success, got \(error.message)")
+        }
+
+        // Move the third profile (now at index 1) down by one (back to index 2).
+        let intermediate = try! upOne.get()
+        let downOne = LanguageProfiles.reorderProfile(in: intermediate, id: thirdID, direction: .down)
+        switch downOne {
+        case .success(let newCatalog):
+            TestSupport.expectEqual(newCatalog.profiles.map(\.id), [firstID, secondID, thirdID])
+        case .failure(let error):
+            fatalError("Expected down reorder success, got \(error.message)")
+        }
+    }
+
+    private static func testReorderProfileRejectsTopUp() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: id, name: "A", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: id
+        )
+        switch LanguageProfiles.reorderProfile(in: catalog, id: id, direction: .up) {
+        case .success:
+            fatalError("Expected top-up rejection")
+        case .failure(.invalidReorderIndex):
+            break
+        case .failure(let other):
+            fatalError("Expected .invalidReorderIndex, got \(other)")
+        }
+    }
+
+    private static func testReorderProfileRejectsBottomDown() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: id, name: "A", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: id
+        )
+        switch LanguageProfiles.reorderProfile(in: catalog, id: id, direction: .down) {
+        case .success:
+            fatalError("Expected bottom-down rejection")
+        case .failure(.invalidReorderIndex):
+            break
+        case .failure(let other):
+            fatalError("Expected .invalidReorderIndex, got \(other)")
+        }
+    }
+
+    private static func testReorderProfileRejectsUnknownID() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: id, name: "A", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: id
+        )
+        switch LanguageProfiles.reorderProfile(in: catalog, id: UUID(), direction: .up) {
+        case .success:
+            fatalError("Expected unknown-ID rejection")
+        case .failure(.unknownProfileID):
+            break
+        case .failure(let other):
+            fatalError("Expected .unknownProfileID, got \(other)")
+        }
+    }
+
+    // MARK: - Delete profile
+
+    private static func testDeleteProfileRejectsFinalProfile() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: id, name: "A", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: id
+        )
+        let store = InMemoryCredentialStore()
+        switch LanguageProfiles.deleteProfile(from: catalog, id: id, credentials: store) {
+        case .success:
+            fatalError("Expected final-profile rejection")
+        case .failure(.cannotDeleteFinalProfile):
+            break
+        case .failure(let other):
+            fatalError("Expected .cannotDeleteFinalProfile, got \(other)")
+        }
+    }
+
+    private static func testDeleteProfileRejectsUnknownID() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: id, name: "A", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: id
+        )
+        let store = InMemoryCredentialStore()
+        switch LanguageProfiles.deleteProfile(from: catalog, id: UUID(), credentials: store) {
+        case .success:
+            fatalError("Expected unknown-ID rejection")
+        case .failure(.unknownProfileID):
+            break
+        case .failure(let other):
+            fatalError("Expected .unknownProfileID, got \(other)")
+        }
+    }
+
+    private static func testDeleteProfileRemovesCredentialOverride() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: firstID, name: "English", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: secondID, name: "Danish", inputLanguageCode: "da", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: firstID
+        )
+        let store = InMemoryCredentialStore(values: [firstID: "synthetic-first-key", secondID: "synthetic-second-key"])
+        switch LanguageProfiles.deleteProfile(from: catalog, id: firstID, credentials: store) {
+        case .success:
+            break
+        case .failure(let error):
+            fatalError("Expected delete success, got \(error.message)")
+        }
+        TestSupport.expect(
+            store.loadAPIKeyOverride(profileID: firstID) == nil,
+            "Deleted profile's credential override must be removed from the store"
+        )
+        TestSupport.expect(
+            store.loadAPIKeyOverride(profileID: secondID) == "synthetic-second-key",
+            "Surviving profile's credential override must remain untouched"
+        )
+    }
+
+    private static func testDeleteActiveProfileSelectsSuccessorInOrder() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let thirdID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: firstID, name: "English", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: secondID, name: "Danish", inputLanguageCode: "da", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: thirdID, name: "French", inputLanguageCode: "fr", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: firstID
+        )
+        let store = InMemoryCredentialStore()
+        // Deleting the active (first) profile must select the successor
+        // in configured order — the profile that followed it, i.e. Danish.
+        switch LanguageProfiles.deleteProfile(from: catalog, id: firstID, credentials: store) {
+        case .success(let newCatalog):
+            TestSupport.expectEqual(newCatalog.activeProfileID, secondID)
+            TestSupport.expectEqual(newCatalog.profiles.map(\.id), [secondID, thirdID])
+        case .failure(let error):
+            fatalError("Expected delete success, got \(error.message)")
+        }
+    }
+
+    private static func testDeleteLastProfileSelectsLastRemaining() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: firstID, name: "English", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: secondID, name: "Danish", inputLanguageCode: "da", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: secondID
+        )
+        let store = InMemoryCredentialStore()
+        // Deleting the last profile (Danish, which is active) must
+        // select the last remaining profile — English.
+        switch LanguageProfiles.deleteProfile(from: catalog, id: secondID, credentials: store) {
+        case .success(let newCatalog):
+            TestSupport.expectEqual(newCatalog.activeProfileID, firstID)
+            TestSupport.expectEqual(newCatalog.profiles.map(\.id), [firstID])
+        case .failure(let error):
+            fatalError("Expected delete success, got \(error.message)")
+        }
+    }
+
+    // MARK: - Select profile
+
+    private static func testSelectProfileSuccess() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: firstID, name: "English", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: secondID, name: "Danish", inputLanguageCode: "da", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: firstID
+        )
+        switch LanguageProfiles.selectProfile(in: catalog, id: secondID) {
+        case .success(let newCatalog):
+            TestSupport.expectEqual(newCatalog.activeProfileID, secondID)
+            TestSupport.expectEqual(newCatalog.profiles, catalog.profiles)
+        case .failure(let error):
+            fatalError("Expected select success, got \(error.message)")
+        }
+    }
+
+    private static func testSelectProfileRejectsUnknownID() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: id, name: "English", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: id
+        )
+        switch LanguageProfiles.selectProfile(in: catalog, id: UUID()) {
+        case .success:
+            fatalError("Expected unknown-ID rejection")
+        case .failure(.unknownProfileID):
+            break
+        case .failure(let other):
+            fatalError("Expected .unknownProfileID, got \(other)")
+        }
+    }
+
+    // MARK: - Update profile overrides
+
+    private static func testUpdateProfileOverridesTrimsAndPersists() {
+        let id = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: id, name: "English", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: id
+        )
+        let updated = LanguageProfile(
+            id: id,
+            name: "English",
+            inputLanguageCode: "en",
+            transcriptionURLOverride: "  https://synthetic.example/v1  ",
+            transcriptionModelOverride: "  profile-model  ",
+            realtimeModelOverride: "  profile-realtime  ",
+            postProcessingPromptOverride: "  profile prompt  "
+        )
+        switch LanguageProfiles.updateProfile(in: catalog, with: updated) {
+        case .success(let newCatalog):
+            TestSupport.expectEqual(newCatalog.profiles[0].transcriptionURLOverride, "https://synthetic.example/v1")
+            TestSupport.expectEqual(newCatalog.profiles[0].transcriptionModelOverride, "profile-model")
+            TestSupport.expectEqual(newCatalog.profiles[0].realtimeModelOverride, "profile-realtime")
+            TestSupport.expectEqual(newCatalog.profiles[0].postProcessingPromptOverride, "profile prompt")
+        case .failure(let error):
+            fatalError("Expected update success, got \(error.message)")
+        }
+    }
+
+    private static func testUpdateProfileRejectsDuplicateName() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: firstID, name: "English", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: secondID, name: "Danish", inputLanguageCode: "da", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: firstID
+        )
+        let updated = LanguageProfile(
+            id: secondID,
+            name: "english",
+            inputLanguageCode: "da",
+            transcriptionURLOverride: "",
+            transcriptionModelOverride: "",
+            realtimeModelOverride: "",
+            postProcessingPromptOverride: ""
+        )
+        switch LanguageProfiles.updateProfile(in: catalog, with: updated) {
+        case .success:
+            fatalError("Expected duplicate-name rejection")
+        case .failure(.duplicateName):
+            break
+        case .failure(let other):
+            fatalError("Expected .duplicateName, got \(other)")
+        }
+    }
+
+    private static func testUpdateProfileRejectsDuplicateLanguageCode() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: firstID, name: "English", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: secondID, name: "Danish", inputLanguageCode: "da", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: firstID
+        )
+        let updated = LanguageProfile(
+            id: secondID,
+            name: "Renamed",
+            inputLanguageCode: "en",
+            transcriptionURLOverride: "",
+            transcriptionModelOverride: "",
+            realtimeModelOverride: "",
+            postProcessingPromptOverride: ""
+        )
+        switch LanguageProfiles.updateProfile(in: catalog, with: updated) {
+        case .success:
+            fatalError("Expected duplicate-code rejection")
+        case .failure(.duplicateLanguageCode):
+            break
+        case .failure(let other):
+            fatalError("Expected .duplicateLanguageCode, got \(other)")
+        }
+    }
+
+    // MARK: - Credential store mutations
+
+    private static func testSetAPIKeyOverridePersistsThroughStore() {
+        let profileID = UUID()
+        let store = InMemoryCredentialStore()
+        LanguageProfiles.setAPIKeyOverride(
+            "  synthetic-key  ",
+            for: profileID,
+            credentials: store
+        )
+        TestSupport.expectEqual(
+            store.loadAPIKeyOverride(profileID: profileID),
+            "synthetic-key"
+        )
+
+        // An empty / whitespace submission must be a no-op, not a
+        // clobber of the stored value — the UI uses Clear for that.
+        LanguageProfiles.setAPIKeyOverride("   ", for: profileID, credentials: store)
+        TestSupport.expectEqual(
+            store.loadAPIKeyOverride(profileID: profileID),
+            "synthetic-key"
+        )
+    }
+
+    private static func testClearAPIKeyOverrideRemovesFromStore() {
+        let profileID = UUID()
+        let store = InMemoryCredentialStore(values: [profileID: "synthetic-key"])
+        LanguageProfiles.clearAPIKeyOverride(for: profileID, credentials: store)
+        TestSupport.expectEqual(
+            store.loadAPIKeyOverride(profileID: profileID),
+            nil
+        )
+    }
+
+    // MARK: - Editor prompt helper
+
+    private static func testEffectiveCleanupPromptUsesProfileOverride() {
+        let profile = LanguageProfile(
+            id: UUID(),
+            name: "P",
+            inputLanguageCode: "en",
+            transcriptionURLOverride: "",
+            transcriptionModelOverride: "",
+            realtimeModelOverride: "",
+            postProcessingPromptOverride: "  profile-specific  "
+        )
+        let globals = LanguageProfileGlobalDefaults(
+            transcriptionBaseURL: "",
+            transcriptionAPIKey: "",
+            transcriptionModel: "",
+            realtimeModel: "",
+            customSystemPrompt: "global prompt"
+        )
+        TestSupport.expectEqual(
+            LanguageProfiles.effectiveCleanupPrompt(
+                profile: profile,
+                globalDefaults: globals,
+                builtInDefaultPrompt: "BUILTIN"
+            ),
+            "profile-specific"
+        )
+    }
+
+    private static func testEffectiveCleanupPromptFallsBackToGlobal() {
+        let profile = LanguageProfile(
+            id: UUID(),
+            name: "P",
+            inputLanguageCode: "en",
+            transcriptionURLOverride: "",
+            transcriptionModelOverride: "",
+            realtimeModelOverride: "",
+            postProcessingPromptOverride: ""
+        )
+        let globals = LanguageProfileGlobalDefaults(
+            transcriptionBaseURL: "",
+            transcriptionAPIKey: "",
+            transcriptionModel: "",
+            realtimeModel: "",
+            customSystemPrompt: "global prompt"
+        )
+        TestSupport.expectEqual(
+            LanguageProfiles.effectiveCleanupPrompt(
+                profile: profile,
+                globalDefaults: globals,
+                builtInDefaultPrompt: "BUILTIN"
+            ),
+            "global prompt"
+        )
+    }
+
+    private static func testEffectiveCleanupPromptFallsBackToBuiltIn() {
+        let profile = LanguageProfile(
+            id: UUID(),
+            name: "P",
+            inputLanguageCode: "en",
+            transcriptionURLOverride: "",
+            transcriptionModelOverride: "",
+            realtimeModelOverride: "",
+            postProcessingPromptOverride: ""
+        )
+        let globals = LanguageProfileGlobalDefaults(
+            transcriptionBaseURL: "",
+            transcriptionAPIKey: "",
+            transcriptionModel: "",
+            realtimeModel: "",
+            customSystemPrompt: ""
+        )
+        TestSupport.expectEqual(
+            LanguageProfiles.effectiveCleanupPrompt(
+                profile: profile,
+                globalDefaults: globals,
+                builtInDefaultPrompt: "BUILTIN"
+            ),
+            "BUILTIN"
+        )
+    }
+
+    private static func testEffectiveTranscriptionValuesFollowOverrideRules() {
+        let profile = LanguageProfile(
+            id: UUID(),
+            name: "P",
+            inputLanguageCode: "en",
+            transcriptionURLOverride: "  profile-url  ",
+            transcriptionModelOverride: "   ",
+            realtimeModelOverride: "profile-realtime",
+            postProcessingPromptOverride: ""
+        )
+        let globals = LanguageProfileGlobalDefaults(
+            transcriptionBaseURL: "global-url",
+            transcriptionAPIKey: "global-key",
+            transcriptionModel: "global-model",
+            realtimeModel: "global-realtime",
+            customSystemPrompt: ""
+        )
+        // URL: profile override wins (trimmed).
+        TestSupport.expectEqual(
+            LanguageProfiles.effectiveTranscriptionBaseURL(profile: profile, globalDefaults: globals),
+            "profile-url"
+        )
+        // Model: profile override is whitespace-only, so the global
+        // value is used.
+        TestSupport.expectEqual(
+            LanguageProfiles.effectiveTranscriptionModel(profile: profile, globalDefaults: globals),
+            "global-model"
+        )
+        // API-key override inheritance is exercised separately by
+        // `testResolutionUsesInjectedCredentialOverride` against the
+        // resolver seam.
     }
 }

@@ -131,4 +131,14 @@ struct AppSettingsStorageLanguageProfileCredentialStore: LanguageProfileCredenti
         guard let value, !value.isEmpty else { return nil }
         return value
     }
+
+    func setAPIKeyOverride(_ value: String, profileID: UUID) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        AppSettingsStorage.save(trimmed, account: Self.account(for: profileID))
+    }
+
+    func clearAPIKeyOverride(profileID: UUID) {
+        AppSettingsStorage.delete(account: Self.account(for: profileID))
+    }
 }

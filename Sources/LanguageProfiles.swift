@@ -111,15 +111,61 @@ enum LanguageProfileCleanupScope {
     case editModeCommandTransform
 }
 
-/// Injected boundary through which Language Profile API-key overrides are
-/// resolved at snapshot time. Credentials never travel through profile
-/// JSON, history, exports, or logs.
+/// User-presentable validation error returned by `LanguageProfiles`
+/// management operations. The `message` value is suitable for inline
+/// Settings UI feedback. Callers should not construct these directly;
+/// they are produced by the domain operations on invalid input.
+enum LanguageProfileValidationError: Error, Equatable {
+    case emptyName
+    case duplicateName(existingProfileID: UUID, existingProfileName: String)
+    case unsupportedLanguageCode(code: String)
+    case duplicateLanguageCode(existingProfileID: UUID, existingProfileName: String)
+    case unknownProfileID(UUID)
+    case cannotDeleteFinalProfile
+    case invalidReorderIndex
+
+    var message: String {
+        switch self {
+        case .emptyName:
+            return "Profile name cannot be empty."
+        case .duplicateName(_, let existingProfileName):
+            return "Another profile is already named \"\(existingProfileName)\"."
+        case .unsupportedLanguageCode(let code):
+            return "Unsupported input language code: \(code.isEmpty ? "(blank)" : code)."
+        case .duplicateLanguageCode(_, let existingProfileName):
+            return "Another profile already uses this language (\(existingProfileName))."
+        case .unknownProfileID(let id):
+            return "Unknown profile ID: \(id.uuidString)."
+        case .cannotDeleteFinalProfile:
+            return "You must keep at least one profile."
+        case .invalidReorderIndex:
+            return "Cannot move the profile beyond the ordered list."
+        }
+    }
+}
+
+/// Direction for `LanguageProfiles.reorderProfile`. `up` moves the
+/// profile toward the start of the ordered list; `down` moves it
+/// toward the end.
+enum LanguageProfileReorderDirection {
+    case up
+    case down
+}
+
+/// Injected boundary through which Language Profile API-key overrides
+/// are resolved at snapshot time and persisted through profile
+/// management UI. Credentials never travel through profile JSON,
+/// history, exports, or logs.
 ///
 /// In production this is bridged to the existing `AppSettingsStorage`
 /// (owner-only application-support `.settings` file). Profile management
-/// UI will extend this protocol with mutation later.
+/// UI uses `setAPIKeyOverride(_:profileID:)` and
+/// `clearAPIKeyOverride(profileID:)` to persist per-profile credential
+/// overrides without leaking them through other storage paths.
 protocol LanguageProfileCredentialStore {
     func loadAPIKeyOverride(profileID: UUID) -> String?
+    func setAPIKeyOverride(_ value: String, profileID: UUID)
+    func clearAPIKeyOverride(profileID: UUID)
 }
 
 extension LanguageProfileCatalog {
@@ -407,5 +453,325 @@ enum LanguageProfiles {
         case .editModeCommandTransform:
             return ""
         }
+    }
+
+    // MARK: Management operations
+
+    /// Add a new profile with the given name and input-language code to
+    /// the catalog. The new profile becomes the Active Profile so the
+    /// user can immediately test it. Each rejection produces a typed
+    /// `LanguageProfileValidationError` whose `message` is suitable for
+    /// inline UI feedback.
+    ///
+    /// - The name is trimmed; an empty trimmed name is rejected.
+    /// - The code must be one of `supportedInputLanguages` (Auto-detect
+    ///   is `""` and is supported). Anything else is rejected so callers
+    ///   cannot silently fall back to Auto-detect by passing an
+    ///   unsupported code.
+    /// - The code must not already be used by another profile in the
+    ///   catalog (this also rejects a second Auto-detect profile since
+    ///   the empty code is shared).
+    static func addProfile(
+        name: String,
+        inputLanguageCode: String,
+        to catalog: LanguageProfileCatalog
+    ) -> Result<(catalog: LanguageProfileCatalog, profile: LanguageProfile), LanguageProfileValidationError> {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedName.isEmpty {
+            return .failure(.emptyName)
+        }
+        let trimmedCode = inputLanguageCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard supportedInputLanguages.contains(where: { $0.code == trimmedCode }) else {
+            return .failure(.unsupportedLanguageCode(code: trimmedCode))
+        }
+        if let existing = catalog.profiles.first(where: { $0.inputLanguageCode == trimmedCode }) {
+            return .failure(.duplicateLanguageCode(
+                existingProfileID: existing.id,
+                existingProfileName: existing.name
+            ))
+        }
+        let nameKey = trimmedName.lowercased()
+        if let existing = catalog.profiles.first(where: { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == nameKey }) {
+            return .failure(.duplicateName(
+                existingProfileID: existing.id,
+                existingProfileName: existing.name
+            ))
+        }
+        let profile = LanguageProfile(
+            id: UUID(),
+            name: trimmedName,
+            inputLanguageCode: trimmedCode,
+            transcriptionURLOverride: "",
+            transcriptionModelOverride: "",
+            realtimeModelOverride: "",
+            postProcessingPromptOverride: ""
+        )
+        var newProfiles = catalog.profiles
+        newProfiles.append(profile)
+        let newCatalog = LanguageProfileCatalog(
+            profiles: newProfiles,
+            activeProfileID: profile.id
+        )
+        return .success((catalog: newCatalog, profile: profile))
+    }
+
+    /// Rename an existing profile. The new name is trimmed; an empty
+    /// trimmed name or a duplicate (case-insensitive against any other
+    /// profile's trimmed name) is rejected. Renaming a profile to its
+    /// own current name is a no-op success.
+    static func renameProfile(
+        in catalog: LanguageProfileCatalog,
+        id: UUID,
+        newName: String
+    ) -> Result<LanguageProfileCatalog, LanguageProfileValidationError> {
+        guard let index = catalog.profiles.firstIndex(where: { $0.id == id }) else {
+            return .failure(.unknownProfileID(id))
+        }
+        let trimmedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedName.isEmpty {
+            return .failure(.emptyName)
+        }
+        let nameKey = trimmedName.lowercased()
+        for (otherIndex, other) in catalog.profiles.enumerated() where otherIndex != index {
+            if other.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == nameKey {
+                return .failure(.duplicateName(
+                    existingProfileID: other.id,
+                    existingProfileName: other.name
+                ))
+            }
+        }
+        if catalog.profiles[index].name == trimmedName {
+            return .success(catalog)
+        }
+        var newProfiles = catalog.profiles
+        var updated = newProfiles[index]
+        updated.name = trimmedName
+        newProfiles[index] = updated
+        return .success(LanguageProfileCatalog(
+            profiles: newProfiles,
+            activeProfileID: catalog.activeProfileID
+        ))
+    }
+
+    /// Move a profile one step in the requested direction within the
+    /// ordered list. Rejects the move at the bounds (top cannot move up,
+    /// bottom cannot move down) so callers can show inline feedback
+    /// instead of silently clamping.
+    static func reorderProfile(
+        in catalog: LanguageProfileCatalog,
+        id: UUID,
+        direction: LanguageProfileReorderDirection
+    ) -> Result<LanguageProfileCatalog, LanguageProfileValidationError> {
+        guard let index = catalog.profiles.firstIndex(where: { $0.id == id }) else {
+            return .failure(.unknownProfileID(id))
+        }
+        let target: Int
+        switch direction {
+        case .up:
+            target = index - 1
+        case .down:
+            target = index + 1
+        }
+        guard target >= 0, target < catalog.profiles.count else {
+            return .failure(.invalidReorderIndex)
+        }
+        var newProfiles = catalog.profiles
+        let moved = newProfiles.remove(at: index)
+        newProfiles.insert(moved, at: target)
+        return .success(LanguageProfileCatalog(
+            profiles: newProfiles,
+            activeProfileID: catalog.activeProfileID
+        ))
+    }
+
+    /// Delete a profile. The final remaining profile cannot be deleted.
+    /// When the deleted profile was the Active Profile, the new active
+    /// profile is selected according to configured order:
+    /// - If the deleted profile was not the last one, the profile that
+    ///   followed it becomes active.
+    /// - If the deleted profile was the last one, the new last profile
+    ///   (the one immediately before the deleted one) becomes active.
+    ///
+    /// The deleted profile's stored credential override is also removed
+    /// from the injected credential store so a later add of a profile
+    /// with the same UUID can never accidentally inherit the prior
+    /// credential.
+    static func deleteProfile(
+        from catalog: LanguageProfileCatalog,
+        id: UUID,
+        credentials: LanguageProfileCredentialStore
+    ) -> Result<LanguageProfileCatalog, LanguageProfileValidationError> {
+        guard let index = catalog.profiles.firstIndex(where: { $0.id == id }) else {
+            return .failure(.unknownProfileID(id))
+        }
+        if catalog.profiles.count <= 1 {
+            return .failure(.cannotDeleteFinalProfile)
+        }
+        var newProfiles = catalog.profiles
+        let removed = newProfiles.remove(at: index)
+        let newActiveID: UUID
+        if catalog.activeProfileID == id {
+            // The deleted profile was active. Pick the successor in
+            // configured order: the profile that followed it, or the
+            // new last profile when the deleted one was at the end.
+            if index < newProfiles.count {
+                newActiveID = newProfiles[index].id
+            } else {
+                newActiveID = newProfiles[newProfiles.count - 1].id
+            }
+        } else {
+            newActiveID = catalog.activeProfileID
+        }
+        credentials.clearAPIKeyOverride(profileID: removed.id)
+        return .success(LanguageProfileCatalog(
+            profiles: newProfiles,
+            activeProfileID: newActiveID
+        ))
+    }
+
+    /// Set the active profile by ID. Rejects an unknown ID so the UI
+    /// cannot accidentally leave the catalog in an inconsistent state.
+    static func selectProfile(
+        in catalog: LanguageProfileCatalog,
+        id: UUID
+    ) -> Result<LanguageProfileCatalog, LanguageProfileValidationError> {
+        guard catalog.profiles.contains(where: { $0.id == id }) else {
+            return .failure(.unknownProfileID(id))
+        }
+        if catalog.activeProfileID == id {
+            return .success(catalog)
+        }
+        return .success(LanguageProfileCatalog(
+            profiles: catalog.profiles,
+            activeProfileID: id
+        ))
+    }
+
+    /// Replace an existing profile's persisted fields (name, input
+    /// language code, and the four non-secret override strings). The
+    /// supplied `updatedProfile` must keep the existing `id`; its
+    /// override strings are trimmed, and the same uniqueness invariants
+    /// that apply to add/rename are enforced (excluding the profile
+    /// being updated from the collision check). Empty override strings
+    /// are kept as `""` so they continue to mean "inherit from global".
+    static func updateProfile(
+        in catalog: LanguageProfileCatalog,
+        with updatedProfile: LanguageProfile
+    ) -> Result<LanguageProfileCatalog, LanguageProfileValidationError> {
+        guard let index = catalog.profiles.firstIndex(where: { $0.id == updatedProfile.id }) else {
+            return .failure(.unknownProfileID(updatedProfile.id))
+        }
+        let trimmedName = updatedProfile.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedName.isEmpty {
+            return .failure(.emptyName)
+        }
+        let trimmedCode = normalizeInputLanguageCode(updatedProfile.inputLanguageCode)
+        for (otherIndex, other) in catalog.profiles.enumerated() where otherIndex != index {
+            if other.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                == trimmedName.lowercased() {
+                return .failure(.duplicateName(
+                    existingProfileID: other.id,
+                    existingProfileName: other.name
+                ))
+            }
+            if other.inputLanguageCode == trimmedCode {
+                return .failure(.duplicateLanguageCode(
+                    existingProfileID: other.id,
+                    existingProfileName: other.name
+                ))
+            }
+        }
+        let normalized = LanguageProfile(
+            id: updatedProfile.id,
+            name: trimmedName,
+            inputLanguageCode: trimmedCode,
+            transcriptionURLOverride: updatedProfile.transcriptionURLOverride
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            transcriptionModelOverride: updatedProfile.transcriptionModelOverride
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            realtimeModelOverride: updatedProfile.realtimeModelOverride
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            postProcessingPromptOverride: updatedProfile.postProcessingPromptOverride
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        var newProfiles = catalog.profiles
+        newProfiles[index] = normalized
+        return .success(LanguageProfileCatalog(
+            profiles: newProfiles,
+            activeProfileID: catalog.activeProfileID
+        ))
+    }
+
+    /// Persist a non-empty API-key override for one profile. Empty or
+    /// whitespace-only values are rejected so the call site cannot
+    /// accidentally clobber a stored credential with empty input; use
+    /// `clearAPIKeyOverride(profileID:credentials:)` to clear instead.
+    static func setAPIKeyOverride(
+        _ value: String,
+        for profileID: UUID,
+        credentials: LanguageProfileCredentialStore
+    ) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        credentials.setAPIKeyOverride(trimmed, profileID: profileID)
+    }
+
+    /// Convenience pass-through that forwards to the injected store.
+    /// Provided so callers don't have to touch the protocol directly.
+    static func clearAPIKeyOverride(
+        for profileID: UUID,
+        credentials: LanguageProfileCredentialStore
+    ) {
+        credentials.clearAPIKeyOverride(profileID: profileID)
+    }
+
+    /// Compute the effective cleanup prompt that the per-profile editor
+    /// "Test" action would send to the post-processing service, without
+    /// invoking any live call. The precedence is:
+    /// 1. The profile's `postProcessingPromptOverride` when non-empty.
+    /// 2. The global `customSystemPrompt` when non-empty.
+    /// 3. The injected `builtInDefaultPrompt` (FreeFlow's built-in
+    ///    default; the caller passes `PostProcessingService.defaultSystemPrompt`
+    ///    in production and an invented synthetic string in tests).
+    ///
+    /// The built-in default is injected so the helper is dependency-free
+    /// and the precedence rule is deterministically testable.
+    static func effectiveCleanupPrompt(
+        profile: LanguageProfile,
+        globalDefaults: LanguageProfileGlobalDefaults,
+        builtInDefaultPrompt: String
+    ) -> String {
+        let trimmedOverride = profile.postProcessingPromptOverride
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedOverride.isEmpty {
+            return trimmedOverride
+        }
+        let trimmedGlobal = globalDefaults.customSystemPrompt
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedGlobal.isEmpty {
+            return trimmedGlobal
+        }
+        return builtInDefaultPrompt
+    }
+
+    /// Compute the resolved transcription base URL that the per-profile
+    /// editor "Test" action would use. Same precedence as the resolver:
+    /// the profile's `transcriptionURLOverride` when non-empty, otherwise
+    /// the global `transcriptionBaseURL`.
+    static func effectiveTranscriptionBaseURL(
+        profile: LanguageProfile,
+        globalDefaults: LanguageProfileGlobalDefaults
+    ) -> String {
+        inherit(profile.transcriptionURLOverride, globalDefaults.transcriptionBaseURL)
+    }
+
+    /// Compute the resolved upload transcription model that the
+    /// per-profile editor "Test" action would use. Same precedence as
+    /// the resolver: profile override when non-empty, otherwise global.
+    static func effectiveTranscriptionModel(
+        profile: LanguageProfile,
+        globalDefaults: LanguageProfileGlobalDefaults
+    ) -> String {
+        inherit(profile.transcriptionModelOverride, globalDefaults.transcriptionModel)
     }
 }
