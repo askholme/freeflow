@@ -3,3 +3,6 @@ build/
 *.swp
 .env
 .build
+.ralphy/
+ralph-start.sh
+replay-task.sh
