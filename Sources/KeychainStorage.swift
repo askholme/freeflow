@@ -115,3 +115,20 @@ enum AppSettingsStorage {
         SecItemDelete(query as CFDictionary)
     }
 }
+
+/// Production bridge that resolves Language Profile credential overrides
+/// through the existing protected application-settings storage. The account
+/// is derived from the stable profile UUID so credentials stay out of
+/// encoded profile data, history, exports, and logs.
+struct AppSettingsStorageLanguageProfileCredentialStore: LanguageProfileCredentialStore {
+    private static func account(for profileID: UUID) -> String {
+        "language_profile_api_key_\(profileID.uuidString)"
+    }
+
+    func loadAPIKeyOverride(profileID: UUID) -> String? {
+        let value = AppSettingsStorage.load(account: Self.account(for: profileID))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value, !value.isEmpty else { return nil }
+        return value
+    }
+}

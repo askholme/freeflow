@@ -29,6 +29,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/AppName.swift \
 	Sources/LLMAPITransport.swift \
 	Sources/LLMCooldownManager.swift \
+	Sources/LanguageProfiles.swift \
 	Sources/LocalParakeetModelManager.swift \
 	Sources/LocalParakeetTranscriptionService.swift \
 	Sources/LocalTranscriptionPolicy.swift \

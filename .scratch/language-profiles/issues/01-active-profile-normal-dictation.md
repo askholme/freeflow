@@ -1,10 +1,10 @@
-Status: ready-for-agent
+Status: completed
 Type: implementation
 Category: enhancement
 Blocked by: none
 Worker: coding-worker-minimax-m3
 Claimed by: 
-Attempts: 1
+Attempts: 2
 
 # 01: Active Profile drives normal dictation
 

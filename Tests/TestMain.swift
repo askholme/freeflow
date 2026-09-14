@@ -13,6 +13,7 @@ struct FreeFlowTests {
         LocalTranscriptionPolicyTests.run()
         PipelineStageToggleTests.run()
         TranscriptTextCoreTests.run()
+        LanguageProfileTests.run()
         print("FreeFlowTests passed")
     }
 }

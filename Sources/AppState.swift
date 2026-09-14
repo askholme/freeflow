@@ -239,6 +239,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let localTranscriptionEnabledStorageKey = "local_transcription_enabled"
     private let disablePostProcessingStorageKey = "disable_post_processing"
     private let disableContextPromptStorageKey = "disable_context_prompt"
+    private let languageProfilesStorageKey = "language_profiles"
+    private let activeLanguageProfileIDStorageKey = "active_language_profile_id"
     private let pasteAfterShortcutReleaseDelay: TimeInterval = 0.03
     private let pressEnterAfterPasteDelay: TimeInterval = 0.08
     private let clipboardRestoreDelay: TimeInterval = 1.0
@@ -246,38 +248,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     static let defaultContextScreenshotMaxDimension = Int(AppContextService.defaultScreenshotMaxDimension)
     static let contextScreenshotDimensionOptions = [1024, 768, 640, 512]
     static let defaultTranscriptionModel = "whisper-large-v3"
-    static let transcriptionLanguageOptions: [(code: String, name: String)] = [
-        ("", "Auto-detect"),
-        ("en", "English"),
-        ("es", "Spanish"),
-        ("fr", "French"),
-        ("de", "German"),
-        ("it", "Italian"),
-        ("pt", "Portuguese"),
-        ("nl", "Dutch"),
-        ("ru", "Russian"),
-        ("ja", "Japanese"),
-        ("ko", "Korean"),
-        ("zh", "Chinese"),
-        ("ar", "Arabic"),
-        ("hi", "Hindi"),
-        ("tr", "Turkish"),
-        ("pl", "Polish"),
-        ("uk", "Ukrainian"),
-        ("sv", "Swedish"),
-        ("no", "Norwegian"),
-        ("da", "Danish"),
-        ("fi", "Finnish"),
-        ("cs", "Czech"),
-        ("el", "Greek"),
-        ("he", "Hebrew"),
-        ("vi", "Vietnamese"),
-        ("th", "Thai"),
-        ("id", "Indonesian"),
-        ("ro", "Romanian"),
-        ("hu", "Hungarian"),
-        ("ca", "Catalan")
-    ]
+    static let transcriptionLanguageOptions: [(code: String, name: String)] = LanguageProfiles.supportedInputLanguages
     static let defaultPostProcessingModel = "openai/gpt-oss-20b"
     static let defaultPostProcessingFallbackModel = "qwen/qwen3.6-27b"
     static let defaultContextModel = "qwen/qwen3.6-27b"
@@ -616,6 +587,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     let hotkeyManager = HotkeyManager()
     let overlayManager = RecordingOverlayManager()
     let localParakeetModelManager = LocalParakeetModelManager()
+    private var languageProfileCatalog: LanguageProfileCatalog
+    private let languageProfileCredentialStore: LanguageProfileCredentialStore
     private var accessibilityTimer: Timer?
     private var audioLevelCancellable: AnyCancellable?
     private var debugOverlayTimer: Timer?
@@ -649,7 +622,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var pendingMicrophonePermissionManualCommandRequested: Bool?
     private let postTranscriptionUpdateReminderDuration: TimeInterval = 7
 
-    init() {
+    init(
+        languageProfileCredentialStore: LanguageProfileCredentialStore = AppSettingsStorageLanguageProfileCredentialStore()
+    ) {
         UserDefaults.standard.removeObject(forKey: "force_http2_transcription")
         let hasCompletedSetup = UserDefaults.standard.bool(forKey: "hasCompletedSetup")
         let apiKey = Self.loadStoredAPIKey(account: apiKeyStorageKey)
@@ -685,6 +660,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let customVocabulary = UserDefaults.standard.string(forKey: customVocabularyStorageKey) ?? ""
         let transcriptionLanguage = Self.normalizeTranscriptionLanguage(
             UserDefaults.standard.string(forKey: transcriptionLanguageStorageKey) ?? ""
+        )
+        // Build the Language Profile catalog from persisted data, seeding
+        // exactly one Default profile from the legacy input-language value
+        // for existing users. Repair any missing/invalid active ID or
+        // invalid profile fields and persist the corrected state when
+        // repair occurred so subsequent launches see the repaired values.
+        let loadedLanguageProfileCatalog = LanguageProfiles.loadCatalog(
+            from: LanguageProfiles.StoredLanguageProfileState(
+                profilesData: UserDefaults.standard.data(forKey: languageProfilesStorageKey),
+                activeProfileID: UserDefaults.standard.string(forKey: activeLanguageProfileIDStorageKey),
+                legacyTranscriptionLanguage: transcriptionLanguage
+            )
         )
         let customSystemPrompt = UserDefaults.standard.string(forKey: customSystemPromptStorageKey) ?? ""
         let customContextPrompt = UserDefaults.standard.string(forKey: customContextPromptStorageKey) ?? ""
@@ -759,6 +746,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             contextModel: contextModel,
             contextScreenshotMaxDimension: contextScreenshotMaxDimension
         )
+        self.languageProfileCatalog = loadedLanguageProfileCatalog.catalog
+        self.languageProfileCredentialStore = languageProfileCredentialStore
         self.hasCompletedSetup = hasCompletedSetup
         self.apiKey = apiKey
         self.apiBaseURL = apiBaseURL
@@ -827,6 +816,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
         if savedCopyAgainCustomShortcut.didUpdateStoredValue {
             persistOptionalShortcut(savedCopyAgainCustomShortcut.binding, key: savedCopyAgainCustomShortcutStorageKey)
+        }
+
+        if loadedLanguageProfileCatalog.didRepairStoredValue {
+            persistLanguageProfiles(loadedLanguageProfileCatalog.catalog)
         }
 
         overlayManager.onStopButtonPressed = { [weak self] in
@@ -1043,11 +1036,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private static func normalizeTranscriptionLanguage(_ language: String) -> String {
-        let normalized = language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard transcriptionLanguageOptions.contains(where: { $0.code == normalized }) else {
-            return ""
-        }
-        return normalized
+        LanguageProfiles.normalizeInputLanguageCode(language)
     }
 
     private var resolvedTranscriptionBaseURL: String {
@@ -1060,22 +1049,69 @@ final class AppState: ObservableObject, @unchecked Sendable {
         return trimmed.isEmpty ? apiKey : trimmed
     }
 
-    func makeTranscriptionService() throws -> TranscriptionService {
+    /// Write the Language Profile catalog to UserDefaults. The non-secret
+    /// profile data is JSON-encoded; the API-key override is intentionally
+    /// absent and is stored separately through `AppSettingsStorage`.
+    private func persistLanguageProfiles(_ catalog: LanguageProfileCatalog) {
+        if let data = try? JSONEncoder().encode(catalog.profiles) {
+            UserDefaults.standard.set(data, forKey: languageProfilesStorageKey)
+        }
+        UserDefaults.standard.set(catalog.activeProfileID.uuidString, forKey: activeLanguageProfileIDStorageKey)
+    }
+
+    /// Snapshot the global values the resolver needs to combine with one
+    /// Language Profile. This is the same set of values the existing
+    /// pipeline already resolves for direct transcription use; the
+    /// resolver exists so that profile overrides can transparently win
+    /// over (or fall through to) these defaults.
+    private func currentLanguageProfileGlobalDefaults() -> LanguageProfileGlobalDefaults {
+        LanguageProfileGlobalDefaults(
+            transcriptionBaseURL: resolvedTranscriptionBaseURL,
+            transcriptionAPIKey: resolvedTranscriptionAPIKey,
+            transcriptionModel: transcriptionModel,
+            realtimeModel: realtimeStreamingModel,
+            customSystemPrompt: customSystemPrompt
+        )
+    }
+
+    /// Resolve the currently `Active Profile` to an immutable snapshot.
+    /// Callers MUST capture the snapshot before kicking off a Processing
+    /// Attempt so concurrent settings edits cannot mix old and new
+    /// configurations for that attempt.
+    private func resolveActiveLanguageProfile() -> ResolvedLanguageProfile {
+        languageProfileCatalog.resolvedActiveProfile(
+            globalDefaults: currentLanguageProfileGlobalDefaults(),
+            credentials: languageProfileCredentialStore
+        )
+    }
+
+    /// Construct a `TranscriptionService` for the resolved active
+    /// Language Profile. Local transcription ignores endpoint and model
+    /// overrides (the local recogniser does not use them) but still
+    /// passes the profile's input-language hint.
+    func makeTranscriptionService(resolvedProfile: ResolvedLanguageProfile) throws -> TranscriptionService {
         if localTranscriptionPolicy.isEnabled {
             guard localParakeetModelManager.store.isInstalled else {
                 throw LocalParakeetError.modelUnavailable
             }
             return try TranscriptionService(
                 localParakeetModelDirectory: localParakeetModelManager.store.modelDirectory,
-                language: resolvedTranscriptionLanguage
+                language: resolvedProfile.languageHint
             )
         }
         return try TranscriptionService(
-            apiKey: resolvedTranscriptionAPIKey,
-            baseURL: resolvedTranscriptionBaseURL,
-            transcriptionModel: transcriptionModel,
-            language: resolvedTranscriptionLanguage
+            apiKey: resolvedProfile.transcriptionAPIKey,
+            baseURL: resolvedProfile.transcriptionBaseURL,
+            transcriptionModel: resolvedProfile.transcriptionModel,
+            language: resolvedProfile.languageHint
         )
+    }
+
+    /// No-argument convenience overload used by the Setup View's
+    /// transcription test. Resolves the current active profile first so
+    /// the test exercises the same code path as a normal attempt.
+    func makeTranscriptionService() throws -> TranscriptionService {
+        try makeTranscriptionService(resolvedProfile: resolveActiveLanguageProfile())
     }
 
     private var resolvedTranscriptionLanguage: String? {
@@ -1248,11 +1284,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
             instructionExecutionGuardEnabled: instructionExecutionGuardEnabled
         )
         let capturedCustomVocabulary = customVocabulary
-        let capturedCustomSystemPrompt = customSystemPrompt
+        // Capture the resolved Language Profile snapshot before the retry
+        // Task begins so settings edits during the retry cannot mix old
+        // and new configurations for this attempt.
+        let resolvedProfile = resolveActiveLanguageProfile()
 
         Task {
             do {
-                let transcriptionService = try makeTranscriptionService()
+                let transcriptionService = try makeTranscriptionService(resolvedProfile: resolvedProfile)
                 let rawTranscript = try await transcriptionService.transcribe(fileURL: audioURL)
                 let parsedTranscript = Self.parseTranscriptCommands(
                     from: rawTranscript,
@@ -1272,7 +1311,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     context: restoredContext,
                     postProcessingService: postProcessingService,
                     customVocabulary: capturedCustomVocabulary,
-                    customSystemPrompt: capturedCustomSystemPrompt,
+                    resolvedProfile: resolvedProfile,
                     outputLanguage: self.outputLanguage,
                     preserveExactWording: self.preserveExactWording
                 )
@@ -2595,7 +2634,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         context: AppContext,
         postProcessingService: PostProcessingService,
         customVocabulary: String,
-        customSystemPrompt: String,
+        resolvedProfile: ResolvedLanguageProfile,
         outputLanguage: String = "",
         preserveExactWording: Bool
     ) async -> (finalTranscript: String, outcome: TranscriptProcessingOutcome, prompt: String) {
@@ -2625,6 +2664,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
         // pipeline (Edit Mode, translation, post-processing) is gated by the
         // user's own toggles above (`disablePostProcessing`, `preserveExactWording`,
         // Edit Mode setting, output language setting).
+
+        // Profile prompt overrides apply only to ordinary dictation cleanup.
+        // Edit Mode keeps its dedicated command-transform prompt: the profile
+        // override (and the global custom prompt) never reach commandTransform.
+        let ordinaryCleanupSystemPrompt = LanguageProfiles.customSystemPrompt(
+            for: intent.isCommandMode ? .editModeCommandTransform : .ordinaryDictation,
+            resolvedProfile: resolvedProfile
+        )
 
         if case .command(let invocation, let selectedText) = intent {
             do {
@@ -2677,7 +2724,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 transcript: trimmedRawTranscript,
                 context: context,
                 customVocabulary: customVocabulary,
-                customSystemPrompt: customSystemPrompt,
+                customSystemPrompt: ordinaryCleanupSystemPrompt,
                 outputLanguage: outputLanguage
             )
             return (result.transcript, .postProcessingSucceeded, result.prompt)
@@ -2743,6 +2790,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
         statusText = "Preparing audio..."
         errorMessage = nil
         playAlertSound(named: "Pop")
+        // Capture the resolved Language Profile snapshot before the
+        // Processing Attempt begins so concurrent settings edits cannot
+        // mix old and new configurations while the attempt is in flight.
+        let resolvedActiveProfile = resolveActiveLanguageProfile()
         overlayManager.showTranscribing()
         audioRecorder.stopRecording { [weak self] fileURL in
             guard let self else { return }
@@ -2802,7 +2853,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 do {
                     await self.finishLocalTranscriptionWarmupIfNeeded()
                     try Task.checkCancellation()
-                    let transcriptionService = try self.makeTranscriptionService()
+                    let transcriptionService = try self.makeTranscriptionService(resolvedProfile: resolvedActiveProfile)
                     async let transcript = Self.resolveRawTranscript(
                         realtimeService: activeRealtime,
                         fileService: transcriptionService,
@@ -2844,7 +2895,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         context: appContext,
                         postProcessingService: postProcessingService,
                         customVocabulary: self.customVocabulary,
-                        customSystemPrompt: self.customSystemPrompt,
+                        resolvedProfile: resolvedActiveProfile,
                         outputLanguage: self.outputLanguage,
                         preserveExactWording: self.preserveExactWording
                     )
