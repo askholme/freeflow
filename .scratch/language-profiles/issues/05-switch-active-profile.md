@@ -3,8 +3,8 @@ Type: implementation
 Category: enhancement
 Blocked by: language-profiles/01-active-profile-normal-dictation, language-profiles/02-manage-language-profiles
 Worker: coding-worker-minimax-m3
-Claimed by:
-Attempts: 0
+Claimed by: 
+Attempts: 1
 
 # 05: Switch the Active Profile globally
 
@@ -22,3 +22,8 @@ Attempts: 0
 - [ ] Existing shortcuts retain their behavior and matching rules.
 - [ ] Deterministic reducer and action tests cover disabled defaults, cycling, wraparound, busy rejection, collisions, and dictation-session isolation.
 - [ ] Repository typechecking and focused tests pass.
+
+
+## Ralph attempt 1
+
+Blocked at 2026-09-14T18:47:59.676131+00:00: controller exited 1 without a final success result
