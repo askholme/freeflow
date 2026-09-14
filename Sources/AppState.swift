@@ -613,6 +613,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var pendingShortcutStartTask: Task<Void, Never>?
     private var pendingShortcutStartMode: RecordingTriggerMode?
     private var realtimeService: RealtimeTranscriptionService?
+    /// Immutable Language Profile snapshot captured at recording start so
+    /// settings edits during the in-flight attempt cannot mix old and new
+    /// configurations. Cleared on every exit path
+    /// (`handleRecordingFailure`, `cancelTranscription`,
+    /// `cancelToggleShortcutSession`) and after `stopAndTranscribe` has
+    /// handed the captured profile to the transcription pipeline.
+    private var capturedRecordingProfile: ResolvedLanguageProfile?
+    /// Immutable `LiveAttemptConfigurationBuilder.Configuration` snapshot
+    /// captured at recording start. Production consumes the captured
+    /// transcription mode (local-vs-upload), ordinary cleanup prompt,
+    /// and realtime decision directly from this snapshot so the
+    /// builder's tests verify the values the recording pipeline actually
+    /// uses. Cleared on every exit path alongside
+    /// `capturedRecordingProfile`.
+    private var capturedAttemptConfiguration: LiveAttemptConfigurationBuilder.Configuration?
     private var automaticTerminationDisabled = false
     private var activeAudioInterruption: ActiveAudioInterruption?
     private var pendingOverlayDismissToken: UUID?
@@ -1295,6 +1310,44 @@ final class AppState: ObservableObject, @unchecked Sendable {
         )
     }
 
+    /// Construct a `TranscriptionService` for an in-flight recording
+    /// attempt using the values the recording pipeline captured at
+    /// recording start. Consumes `attempt.transcriptionMode` directly so
+    /// the local-vs-upload decision — including the language hint the local
+    /// recogniser should start with, and the endpoint, credential, model,
+    /// and language the upload fallback should use — was already locked in
+    /// at attempt-start and cannot be altered by a settings toggle that
+    /// fires while the attempt is in flight. The builder's tests verify
+    /// the captured values match what production actually consumes.
+    func makeTranscriptionService(
+        attempt: LiveAttemptConfigurationBuilder.Configuration?
+    ) throws -> TranscriptionService {
+        guard let attempt else {
+            throw NSError(
+                domain: "FreeFlow.AppState",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Recording attempt configuration missing."]
+            )
+        }
+        switch attempt.transcriptionMode {
+        case .local(let languageHint):
+            guard localParakeetModelManager.store.isInstalled else {
+                throw LocalParakeetError.modelUnavailable
+            }
+            return try TranscriptionService(
+                localParakeetModelDirectory: localParakeetModelManager.store.modelDirectory,
+                language: languageHint
+            )
+        case .upload(let apiKey, let baseURL, let model, let language):
+            return try TranscriptionService(
+                apiKey: apiKey,
+                baseURL: baseURL,
+                transcriptionModel: model,
+                language: language
+            )
+        }
+    }
+
     /// No-argument convenience overload used by the Setup View's
     /// transcription test. Resolves the current active profile first so
     /// the test exercises the same code path as a normal attempt.
@@ -1476,6 +1529,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
         // Task begins so settings edits during the retry cannot mix old
         // and new configurations for this attempt.
         let resolvedProfile = resolveActiveLanguageProfile()
+        // Resolve the ordinary cleanup prompt from the captured profile
+        // here, mirroring what the live-attempt builder would compute, so
+        // the prompt we feed `processTranscript` reflects the profile's
+        // ordinary cleanup override (not a fresh `customSystemPrompt`
+        // read). Edit Mode always passes `""` to the cleanup prompt, so
+        // this value is unused for command invocations.
+        let ordinaryCleanupSystemPrompt = LanguageProfiles.customSystemPrompt(
+            for: .ordinaryDictation,
+            resolvedProfile: resolvedProfile
+        )
 
         Task {
             do {
@@ -1499,7 +1562,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     context: restoredContext,
                     postProcessingService: postProcessingService,
                     customVocabulary: capturedCustomVocabulary,
-                    resolvedProfile: resolvedProfile,
+                    ordinaryCleanupSystemPrompt: ordinaryCleanupSystemPrompt,
                     outputLanguage: self.outputLanguage,
                     preserveExactWording: self.preserveExactWording
                 )
@@ -2086,6 +2149,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         contextCaptureTask?.cancel()
         contextCaptureTask = nil
         capturedContext = nil
+        capturedRecordingProfile = nil
+        capturedAttemptConfiguration = nil
         currentSessionIntent = .dictation
         isRecording = false
         errorMessage = nil
@@ -2112,6 +2177,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         contextCaptureTask?.cancel()
         contextCaptureTask = nil
         capturedContext = nil
+        capturedRecordingProfile = nil
+        capturedAttemptConfiguration = nil
         shortcutSessionController.reset()
         activeRecordingTriggerMode = nil
         currentSessionIntent = .dictation
@@ -2490,6 +2557,31 @@ final class AppState: ObservableObject, @unchecked Sendable {
         clearPendingOverlayDismissToken()
         errorMessage = nil
 
+        // Capture one immutable Language Profile snapshot for the entire
+        // Processing Attempt before kicking off any services. Settings
+        // edits during recording or transcription must not change the
+        // realtime endpoint, credential, realtime model, language hint,
+        // upload-fallback configuration, or cleanup prompt for this
+        // attempt. The snapshot is consumed by both the realtime stream
+        // (below) and `stopAndTranscribe` (later) and is cleared on
+        // every exit path.
+        capturedRecordingProfile = resolveActiveLanguageProfile()
+        // Build the recording-attempt configuration ONCE from the captured
+        // profile snapshot and reuse it for every pipeline stage that
+        // depends on the captured values. Production reads the captured
+        // transcription mode, ordinary cleanup prompt, and realtime
+        // decision directly from this snapshot — never from live settings
+        // — so the builder's tests verify production behavior.
+        if let profile = capturedRecordingProfile {
+            capturedAttemptConfiguration = LiveAttemptConfigurationBuilder.configuration(
+                resolvedProfile: profile,
+                realtimeStreamingEnabled: realtimeStreamingEnabled,
+                localPolicy: localTranscriptionPolicy
+            )
+        } else {
+            capturedAttemptConfiguration = nil
+        }
+
         isRecording = true
         statusText = "Starting..."
         hasShownScreenshotPermissionAlert = false
@@ -2545,7 +2637,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             }
         }
 
-        startRealtimeStreamingIfEnabled()
+        startRealtimeStreamingIfEnabled(attempt: capturedAttemptConfiguration)
 
         // Start engine on background thread so UI isn't blocked
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -2582,6 +2674,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         contextCaptureTask?.cancel()
         contextCaptureTask = nil
         capturedContext = nil
+        capturedRecordingProfile = nil
+        capturedAttemptConfiguration = nil
         tearDownRealtimeService()
         cancelLocalTranscriptionWarmup()
         audioRecorder.cleanup()
@@ -2822,7 +2916,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         context: AppContext,
         postProcessingService: PostProcessingService,
         customVocabulary: String,
-        resolvedProfile: ResolvedLanguageProfile,
+        ordinaryCleanupSystemPrompt: String,
         outputLanguage: String = "",
         preserveExactWording: Bool
     ) async -> (finalTranscript: String, outcome: TranscriptProcessingOutcome, prompt: String) {
@@ -2854,12 +2948,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
         // Edit Mode setting, output language setting).
 
         // Profile prompt overrides apply only to ordinary dictation cleanup.
-        // Edit Mode keeps its dedicated command-transform prompt: the profile
-        // override (and the global custom prompt) never reach commandTransform.
-        let ordinaryCleanupSystemPrompt = LanguageProfiles.customSystemPrompt(
-            for: intent.isCommandMode ? .editModeCommandTransform : .ordinaryDictation,
-            resolvedProfile: resolvedProfile
-        )
+        // Edit Mode keeps its dedicated command-transform prompt and ignores
+        // the supplied prompt entirely — the caller threads it from the
+        // captured attempt configuration's `ordinaryCleanupSystemPrompt`
+        // so the builder's tests verify production behavior.
 
         if case .command(let invocation, let selectedText) = intent {
             do {
@@ -2978,10 +3070,28 @@ final class AppState: ObservableObject, @unchecked Sendable {
         statusText = "Preparing audio..."
         errorMessage = nil
         playAlertSound(named: "Pop")
-        // Capture the resolved Language Profile snapshot before the
-        // Processing Attempt begins so concurrent settings edits cannot
-        // mix old and new configurations while the attempt is in flight.
-        let resolvedActiveProfile = resolveActiveLanguageProfile()
+        // Use the recording-attempt configuration captured at recording
+        // start so concurrent settings edits cannot mix old and new
+        // configurations while the attempt is in flight. The captured
+        // configuration already embeds the resolved Language Profile
+        // snapshot, so production never re-reads from
+        // `capturedRecordingProfile` here. If no configuration exists
+        // the attempt was never started cleanly — bail rather than
+        // resolve fresh and risk inconsistent settings.
+        guard let attemptConfiguration = capturedAttemptConfiguration else {
+            isTranscribing = false
+            errorMessage = "Recording session was not initialized."
+            statusText = "Error"
+            overlayManager.dismiss()
+            refreshAvailableMicrophonesIfNeeded()
+            return
+        }
+        // The captured snapshot and attempt configuration have been
+        // handed to the transcription pipeline; clear them so a
+        // subsequent recording starts a fresh attempt with its own
+        // snapshot.
+        capturedRecordingProfile = nil
+        capturedAttemptConfiguration = nil
         overlayManager.showTranscribing()
         audioRecorder.stopRecording { [weak self] fileURL in
             guard let self else { return }
@@ -3041,7 +3151,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 do {
                     await self.finishLocalTranscriptionWarmupIfNeeded()
                     try Task.checkCancellation()
-                    let transcriptionService = try self.makeTranscriptionService(resolvedProfile: resolvedActiveProfile)
+                    let transcriptionService = try self.makeTranscriptionService(attempt: attemptConfiguration)
                     async let transcript = Self.resolveRawTranscript(
                         realtimeService: activeRealtime,
                         fileService: transcriptionService,
@@ -3083,7 +3193,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         context: appContext,
                         postProcessingService: postProcessingService,
                         customVocabulary: self.customVocabulary,
-                        resolvedProfile: resolvedActiveProfile,
+                        ordinaryCleanupSystemPrompt: attemptConfiguration.ordinaryCleanupSystemPrompt,
                         outputLanguage: self.outputLanguage,
                         preserveExactWording: self.preserveExactWording
                     )
@@ -3278,22 +3388,41 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func startRealtimeStreamingIfEnabled() {
-        guard localTranscriptionPolicy.allowsRealtimeStreaming else { return }
-        guard realtimeStreamingEnabled else { return }
-        let trimmedBase = resolvedTranscriptionBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedBase.isEmpty else {
-            os_log(.info, log: recordingLog, "realtime streaming requested but base URL is empty — skipping")
+    private func startRealtimeStreamingIfEnabled(
+        attempt: LiveAttemptConfigurationBuilder.Configuration?
+    ) {
+        // No captured attempt means recording never actually started
+        // (the configuration is built before this is called), so there
+        // is nothing to configure.
+        guard let attempt else { return }
+        guard attempt.shouldStartRealtime,
+              let realtimeConfig = attempt.realtimeConfiguration else {
+            // Mirror the pre-refactor log behaviour so production logs
+            // remain greppable. The three skip reasons are now
+            // decided by the pure helper; the message is emitted for
+            // whichever reason applies.
+            if !realtimeStreamingEnabled {
+                os_log(
+                    .info,
+                    log: recordingLog,
+                    "realtime streaming requested but globally disabled — skipping"
+                )
+            } else if !localTranscriptionPolicy.allowsRealtimeStreaming {
+                os_log(
+                    .info,
+                    log: recordingLog,
+                    "realtime streaming requested but local transcription is active — skipping"
+                )
+            } else {
+                os_log(
+                    .info,
+                    log: recordingLog,
+                    "realtime streaming requested but base URL is empty — skipping"
+                )
+            }
             return
         }
-        let model = realtimeStreamingModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        let config = RealtimeTranscriptionService.Configuration(
-            baseURL: trimmedBase,
-            apiKey: resolvedTranscriptionAPIKey,
-            model: model,
-            language: resolvedTranscriptionLanguage
-        )
-        let service = RealtimeTranscriptionService(config: config)
+        let service = RealtimeTranscriptionService(config: realtimeConfig)
         do {
             try service.start()
         } catch {
@@ -3448,6 +3577,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             contextCaptureTask?.cancel()
             contextCaptureTask = nil
             capturedContext = nil
+            capturedRecordingProfile = nil
+            capturedAttemptConfiguration = nil
             isRecording = false
             restoreAudioInterruptionIfNeeded()
             shortcutSessionController.reset()

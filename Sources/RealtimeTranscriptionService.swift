@@ -4,14 +4,14 @@ import os.log
 private let realtimeLog = OSLog(subsystem: "com.zachlatta.freeflow", category: "RealtimeTranscription")
 
 enum RealtimeTranscriptionError: LocalizedError {
-    case invalidBaseURL(String)
+    case invalidBaseURL
     case notConnected
     case serverError(code: String, message: String)
     case closedBeforeFinal
 
     var errorDescription: String? {
         switch self {
-        case .invalidBaseURL(let url): return "Cannot derive a WebSocket URL from \(url)"
+        case .invalidBaseURL: return "Cannot derive a WebSocket URL from the configured base URL"
         case .notConnected: return "Realtime transcription socket is not connected"
         case .serverError(let code, let message): return "Realtime server error [\(code)]: \(message)"
         case .closedBeforeFinal: return "Realtime socket closed before emitting the final transcript"
@@ -20,7 +20,7 @@ enum RealtimeTranscriptionError: LocalizedError {
 }
 
 final class RealtimeTranscriptionService {
-    struct Configuration {
+    struct Configuration: Equatable {
         let baseURL: String
         let apiKey: String
         let model: String
@@ -62,7 +62,9 @@ final class RealtimeTranscriptionService {
             model: config.model,
             language: config.language
         ) else {
-            throw RealtimeTranscriptionError.invalidBaseURL(config.baseURL)
+            // Generic message so the configured provider URL (which may
+            // contain secrets) never lands in logs or error surfaces.
+            throw RealtimeTranscriptionError.invalidBaseURL
         }
 
         var request = URLRequest(url: wsURL)

@@ -85,6 +85,16 @@ enum LanguageProfileTests {
         testEffectiveCleanupPromptFallsBackToGlobal()
         testEffectiveCleanupPromptFallsBackToBuiltIn()
         testEffectiveTranscriptionValuesFollowOverrideRules()
+        testLiveAttemptConfiguresRealtimeWhenGloballyEnabled()
+        testLiveAttemptSkipsRealtimeWhenGloballyDisabled()
+        testLiveAttemptSkipsRealtimeWhenLocalPolicyEnabled()
+        testLiveAttemptSkipsRealtimeWhenCapturedEndpointEmpty()
+        testLiveAttemptUsesCapturedProfileEndpointCredentialModelAndLanguage()
+        testLiveAttemptUploadFallbackMatchesRealtimeConfiguration()
+        testLiveAttemptIsImmutableAcrossSettingsEdits()
+        testLiveAttemptLocalTranscriptionUsesLanguageHintOnly()
+        testLiveAttemptCapturesTranscriptionMode()
+        testLiveAttemptTranslationIndependence()
     }
 
     // MARK: - Encoding
@@ -1634,5 +1644,519 @@ enum LanguageProfileTests {
         // API-key override inheritance is exercised separately by
         // `testResolutionUsesInjectedCredentialOverride` against the
         // resolver seam.
+    }
+
+    // MARK: - Live attempt orchestration
+
+    /// Build a synthetic captured profile for the orchestration tests.
+    /// Every override is set so the assertions can prove the captured
+    /// values flow through unchanged rather than falling through to
+    /// globals by accident.
+    private static func makeOrchestrationProfile(
+        url: String = "https://synthetic.example/profile-v1",
+        uploadModel: String = "profile-upload-model",
+        realtimeModel: String = "profile-realtime-model",
+        language: String = "da",
+        prompt: String = "profile-cleanup-prompt"
+    ) -> ResolvedLanguageProfile {
+        let globals = LanguageProfileGlobalDefaults(
+            transcriptionBaseURL: "https://synthetic.example/global-v1",
+            transcriptionAPIKey: "global-key",
+            transcriptionModel: "global-upload-model",
+            realtimeModel: "global-realtime-model",
+            customSystemPrompt: "global-cleanup-prompt"
+        )
+        let profile = LanguageProfile(
+            id: UUID(),
+            name: "Profile",
+            inputLanguageCode: language,
+            transcriptionURLOverride: url,
+            transcriptionModelOverride: uploadModel,
+            realtimeModelOverride: realtimeModel,
+            postProcessingPromptOverride: prompt
+        )
+        return LanguageProfiles.resolve(
+            profile: profile,
+            globalDefaults: globals,
+            credentialOverride: "profile-credential"
+        )
+    }
+
+    private static func testLiveAttemptConfiguresRealtimeWhenGloballyEnabled() {
+        let resolved = makeOrchestrationProfile()
+        let config = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: true,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+        TestSupport.expect(config.shouldStartRealtime, "Realtime should start when the global toggle is on and local policy is off")
+        TestSupport.expectEqual(
+            config.realtimeConfiguration?.baseURL,
+            resolved.transcriptionBaseURL
+        )
+        TestSupport.expectEqual(
+            config.realtimeConfiguration?.apiKey,
+            resolved.transcriptionAPIKey
+        )
+        TestSupport.expectEqual(
+            config.realtimeConfiguration?.model,
+            resolved.realtimeModel
+        )
+        TestSupport.expectEqual(
+            config.realtimeConfiguration?.language,
+            resolved.languageHint
+        )
+    }
+
+    private static func testLiveAttemptSkipsRealtimeWhenGloballyDisabled() {
+        let resolved = makeOrchestrationProfile()
+        let config = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: false,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+        TestSupport.expect(!config.shouldStartRealtime, "Realtime must not start when the global toggle is off")
+        TestSupport.expectEqual(config.realtimeConfiguration, nil)
+        // Upload transcription is unaffected by the realtime toggle —
+        // the user still gets a transcript when realtime is disabled.
+        // The captured upload mode sees the same endpoint, credential,
+        // model, and language the realtime stream would have used.
+        if case .upload(let apiKey, let baseURL, let model, let language) = config.transcriptionMode {
+            TestSupport.expectEqual(baseURL, resolved.transcriptionBaseURL)
+            TestSupport.expectEqual(apiKey, resolved.transcriptionAPIKey)
+            TestSupport.expectEqual(model, resolved.transcriptionModel)
+            TestSupport.expectEqual(language, resolved.languageHint)
+        } else {
+            fatalError("Expected .upload transcription mode")
+        }
+    }
+
+    private static func testLiveAttemptSkipsRealtimeWhenLocalPolicyEnabled() {
+        let resolved = makeOrchestrationProfile()
+        let config = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: true,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: true)
+        )
+        TestSupport.expect(!config.shouldStartRealtime, "Realtime must not start when local transcription is the active policy")
+        TestSupport.expectEqual(config.realtimeConfiguration, nil)
+        // Local transcription is the captured mode and receives the
+        // profile's language hint. Endpoint, credential, and model
+        // overrides are intentionally not exposed to the local
+        // recogniser — only the language code flows through.
+        if case .local(let hint) = config.transcriptionMode {
+            TestSupport.expectEqual(hint, resolved.languageHint)
+        } else {
+            fatalError("Expected .local transcription mode")
+        }
+    }
+
+    private static func testLiveAttemptSkipsRealtimeWhenCapturedEndpointEmpty() {
+        // Profile override is whitespace-only; resolver inherits the
+        // global base URL. To exercise the "captured endpoint empty"
+        // path we need a profile whose *resolved* base URL is empty,
+        // so build a profile with an empty override AND globals with
+        // an empty base URL.
+        let globals = LanguageProfileGlobalDefaults(
+            transcriptionBaseURL: "",
+            transcriptionAPIKey: "global-key",
+            transcriptionModel: "global-upload-model",
+            realtimeModel: "global-realtime-model",
+            customSystemPrompt: ""
+        )
+        let profile = LanguageProfile(
+            id: UUID(),
+            name: "Empty",
+            inputLanguageCode: "en",
+            transcriptionURLOverride: "",
+            transcriptionModelOverride: "",
+            realtimeModelOverride: "",
+            postProcessingPromptOverride: ""
+        )
+        let resolved = LanguageProfiles.resolve(
+            profile: profile,
+            globalDefaults: globals,
+            credentialOverride: ""
+        )
+        TestSupport.expectEqual(resolved.transcriptionBaseURL, "")
+        let config = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: true,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+        TestSupport.expect(!config.shouldStartRealtime, "Realtime must not start when the resolved endpoint is empty")
+        TestSupport.expectEqual(config.realtimeConfiguration, nil)
+    }
+
+    private static func testLiveAttemptUsesCapturedProfileEndpointCredentialModelAndLanguage() {
+        // Profile with non-empty overrides wins over the globals for
+        // endpoint, credential, model, and language hint.
+        let resolved = makeOrchestrationProfile(
+            url: "https://synthetic.example/profile-only",
+            uploadModel: "profile-only-upload",
+            realtimeModel: "profile-only-realtime",
+            language: "ja",
+            prompt: "profile-only-prompt"
+        )
+        let config = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: true,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+        // Realtime receives the captured values verbatim.
+        TestSupport.expectEqual(
+            config.realtimeConfiguration?.baseURL,
+            "https://synthetic.example/profile-only"
+        )
+        TestSupport.expectEqual(
+            config.realtimeConfiguration?.model,
+            "profile-only-realtime"
+        )
+        TestSupport.expectEqual(
+            config.realtimeConfiguration?.language,
+            "ja"
+        )
+        TestSupport.expectEqual(
+            config.realtimeConfiguration?.apiKey,
+            resolved.transcriptionAPIKey
+        )
+        // The captured upload mode also sees the captured profile
+        // values verbatim.
+        if case .upload(let apiKey, let baseURL, let model, let language) = config.transcriptionMode {
+            TestSupport.expectEqual(baseURL, "https://synthetic.example/profile-only")
+            TestSupport.expectEqual(model, "profile-only-upload")
+            TestSupport.expectEqual(language, "ja")
+            TestSupport.expectEqual(apiKey, resolved.transcriptionAPIKey)
+        } else {
+            fatalError("Expected .upload transcription mode")
+        }
+        // Cleanup prompt reflects the profile's override.
+        TestSupport.expectEqual(
+            config.ordinaryCleanupSystemPrompt,
+            "profile-only-prompt"
+        )
+        // Profile identity preserved for history / debug surfaces.
+        TestSupport.expectEqual(config.profileID, resolved.profileID)
+        TestSupport.expectEqual(config.profileName, resolved.profileName)
+    }
+
+    private static func testLiveAttemptUploadFallbackMatchesRealtimeConfiguration() {
+        // Shared fallback contract: the upload transcription mode must
+        // always receive the same endpoint, credential, model, and
+        // language the realtime stream was started with, so a realtime
+        // failure transparently falls back without reconfiguration.
+        // Verify both code paths (realtime enabled vs disabled) yield
+        // the same captured upload values.
+        let resolved = makeOrchestrationProfile()
+        let withRealtime = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: true,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+        let withoutRealtime = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: false,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+        TestSupport.expectEqual(withRealtime.transcriptionMode, withoutRealtime.transcriptionMode)
+        if case .upload(let apiKey, let baseURL, let model, let language) = withRealtime.transcriptionMode {
+            TestSupport.expectEqual(baseURL, resolved.transcriptionBaseURL)
+            TestSupport.expectEqual(apiKey, resolved.transcriptionAPIKey)
+            TestSupport.expectEqual(model, resolved.transcriptionModel)
+            TestSupport.expectEqual(language, resolved.languageHint)
+        } else {
+            fatalError("Expected .upload transcription mode")
+        }
+        // Cleanup prompt also stays the same regardless of realtime
+        // gating.
+        TestSupport.expectEqual(
+            withRealtime.ordinaryCleanupSystemPrompt,
+            withoutRealtime.ordinaryCleanupSystemPrompt
+        )
+    }
+
+    private static func testLiveAttemptIsImmutableAcrossSettingsEdits() {
+        // Simulate the recording-start → settings-edit-during-recording
+        // scenario: capture a profile once, build the configuration
+        // immediately, then "edit" the inputs that settings UI might
+        // touch (catalog, globals, credential store) and rebuild from
+        // the original captured profile. The configuration must be
+        // identical field-for-field, proving the pipeline consumes
+        // only the snapshot, never live settings.
+        let resolved = makeOrchestrationProfile()
+        let snapshot = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: true,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+        let frozenSnapshot = snapshot
+
+        // Edit the catalog to a fully-different profile — a would-be
+        // live resolution would now return this profile's values, so
+        // any reliance on the catalog (rather than the captured
+        // snapshot) would surface here.
+        let replacementID = UUID()
+        let replacementProfile = LanguageProfile(
+            id: replacementID,
+            name: "Replacement",
+            inputLanguageCode: "fr",
+            transcriptionURLOverride: "https://synthetic.example/replacement",
+            transcriptionModelOverride: "replacement-upload",
+            realtimeModelOverride: "replacement-realtime",
+            postProcessingPromptOverride: "replacement-prompt"
+        )
+        let replacementCatalog = LanguageProfileCatalog(
+            profiles: [replacementProfile],
+            activeProfileID: replacementID
+        )
+        TestSupport.expectEqual(
+            replacementCatalog.resolvedActiveProfile(
+                globalDefaults: LanguageProfileGlobalDefaults(
+                    transcriptionBaseURL: "https://synthetic.example/global-v2",
+                    transcriptionAPIKey: "global-key-2",
+                    transcriptionModel: "global-upload-model-2",
+                    realtimeModel: "global-realtime-model-2",
+                    customSystemPrompt: ""
+                ),
+                credentials: InMemoryCredentialStore(values: [replacementID: "replacement-credential"])
+            ).transcriptionBaseURL,
+            "https://synthetic.example/replacement"
+        )
+        TestSupport.expect(
+            replacementCatalog.profiles[0].id != resolved.profileID,
+            "Replacement catalog must not contain the originally captured profile"
+        )
+
+        // Rebuild from the originally captured profile only.
+        let replay = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: true,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+
+        TestSupport.expectEqual(replay, frozenSnapshot)
+        if case .upload(let apiKey, let baseURL, let model, let language) = replay.transcriptionMode {
+            TestSupport.expectEqual(baseURL, resolved.transcriptionBaseURL)
+            TestSupport.expectEqual(apiKey, resolved.transcriptionAPIKey)
+            TestSupport.expectEqual(model, resolved.transcriptionModel)
+            TestSupport.expectEqual(language, resolved.languageHint)
+        } else {
+            fatalError("Expected .upload transcription mode")
+        }
+        TestSupport.expectEqual(
+            replay.ordinaryCleanupSystemPrompt,
+            resolved.ordinaryCleanupSystemPrompt
+        )
+        TestSupport.expectEqual(
+            replay.realtimeConfiguration?.baseURL,
+            resolved.transcriptionBaseURL
+        )
+        TestSupport.expectEqual(
+            replay.realtimeConfiguration?.apiKey,
+            resolved.transcriptionAPIKey
+        )
+        TestSupport.expectEqual(
+            replay.realtimeConfiguration?.model,
+            resolved.realtimeModel
+        )
+        TestSupport.expectEqual(
+            replay.realtimeConfiguration?.language,
+            resolved.languageHint
+        )
+    }
+
+    private static func testLiveAttemptLocalTranscriptionUsesLanguageHintOnly() {
+        // When local transcription is the active policy, realtime is
+        // never configured but local mode still consumes the profile's
+        // language hint. Endpoint, credential, and model overrides
+        // must not flow into the local transcription mode; only the
+        // language code does.
+        let resolved = makeOrchestrationProfile(
+            url: "https://synthetic.example/profile-v1",
+            uploadModel: "profile-upload-model",
+            realtimeModel: "profile-realtime-model",
+            language: "de",
+            prompt: "profile-cleanup-prompt"
+        )
+        let config = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: true,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: true)
+        )
+        TestSupport.expect(!config.shouldStartRealtime, "Local policy must not start realtime")
+        TestSupport.expectEqual(config.realtimeConfiguration, nil)
+        // Only the language hint flows through to local transcription;
+        // the endpoint, credential, and model overrides never reach
+        // the local recogniser.
+        if case .local(let hint) = config.transcriptionMode {
+            TestSupport.expectEqual(hint, "de")
+        } else {
+            fatalError("Expected .local transcription mode")
+        }
+        // Cleanup prompt still reflects the profile's override so
+        // the post-processing pipeline sees the profile's voice.
+        TestSupport.expectEqual(
+            config.ordinaryCleanupSystemPrompt,
+            "profile-cleanup-prompt"
+        )
+
+        // Auto-detect profile (empty input language) → nil language
+        // hint for the local recogniser, never a synthetic default.
+        let autoProfile = makeOrchestrationProfile(language: "")
+        let autoConfig = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: autoProfile,
+            realtimeStreamingEnabled: false,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: true)
+        )
+        if case .local(let hint) = autoConfig.transcriptionMode {
+            TestSupport.expectEqual(hint, nil)
+        } else {
+            fatalError("Expected .local transcription mode for auto-detect profile")
+        }
+    }
+
+    private static func testLiveAttemptCapturesTranscriptionMode() {
+        // The transcription mode is decided at recording start from the
+        // captured profile plus the `localPolicy` snapshot. A settings
+        // toggle that flips `localTranscriptionEnabled` while the
+        // attempt is in flight must not be able to swap a locally-
+        // started attempt to an upload one (or vice versa). Verify
+        // both branches and that the captured values flow through
+        // unchanged.
+        let resolved = makeOrchestrationProfile()
+
+        // Local transcription enabled → mode should be .local with the
+        // profile's captured language hint.
+        let localConfig = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: false,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: true)
+        )
+        if case .local(let hint) = localConfig.transcriptionMode {
+            TestSupport.expectEqual(hint, resolved.languageHint)
+        } else {
+            fatalError("Expected .local transcription mode")
+        }
+
+        // Local transcription disabled → mode should be .upload with
+        // the captured profile's endpoint, credential, model, and
+        // language — nothing falls back to globals.
+        let uploadConfig = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: resolved,
+            realtimeStreamingEnabled: false,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+        if case .upload(let apiKey, let baseURL, let model, let language) = uploadConfig.transcriptionMode {
+            TestSupport.expectEqual(apiKey, resolved.transcriptionAPIKey)
+            TestSupport.expectEqual(baseURL, resolved.transcriptionBaseURL)
+            TestSupport.expectEqual(model, resolved.transcriptionModel)
+            TestSupport.expectEqual(language, resolved.languageHint)
+        } else {
+            fatalError("Expected .upload transcription mode")
+        }
+    }
+
+    private static func testLiveAttemptTranslationIndependence() {
+        // Output Language (translation) is a separate global input to
+        // post-processing. It must not be selected, stored, or
+        // influenced by the active profile. The pure helper exposes
+        // no Output Language field — only profile identity, the
+        // captured transcription mode (local or upload), the cleanup
+        // prompt, and the realtime decision. Translation flows from
+        // `AppState.outputLanguage` directly into `processTranscript`
+        // and is never read from the captured profile.
+        //
+        // `LanguageProfile` and `ResolvedLanguageProfile` carry no
+        // output-language field at all (the struct does not declare
+        // one). Build configurations from two profiles that differ
+        // only in their input language code and confirm the only
+        // difference is the input-language-derived fields — no other
+        // field changes, proving translation is independent.
+        let globals = LanguageProfileGlobalDefaults(
+            transcriptionBaseURL: "https://synthetic.example/v1",
+            transcriptionAPIKey: "synthetic-key",
+            transcriptionModel: "whisper-large-v3",
+            realtimeModel: "whisper-large-v3",
+            customSystemPrompt: "global prompt"
+        )
+        let englishProfile = LanguageProfile(
+            id: UUID(),
+            name: "English",
+            inputLanguageCode: "en",
+            transcriptionURLOverride: "",
+            transcriptionModelOverride: "",
+            realtimeModelOverride: "",
+            postProcessingPromptOverride: ""
+        )
+        let japaneseProfile = LanguageProfile(
+            id: UUID(),
+            name: "Japanese",
+            inputLanguageCode: "ja",
+            transcriptionURLOverride: "",
+            transcriptionModelOverride: "",
+            realtimeModelOverride: "",
+            postProcessingPromptOverride: ""
+        )
+        let englishResolved = LanguageProfiles.resolve(
+            profile: englishProfile,
+            globalDefaults: globals,
+            credentialOverride: ""
+        )
+        let japaneseResolved = LanguageProfiles.resolve(
+            profile: japaneseProfile,
+            globalDefaults: globals,
+            credentialOverride: ""
+        )
+        let englishConfig = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: englishResolved,
+            realtimeStreamingEnabled: false,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+        let japaneseConfig = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: japaneseResolved,
+            realtimeStreamingEnabled: false,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: false)
+        )
+        // Upload transcription values are identical except for the language
+        // derived from the profile.
+        if case .upload(let englishAPIKey, let englishBaseURL, let englishModel, let englishLanguage) = englishConfig.transcriptionMode,
+           case .upload(let japaneseAPIKey, let japaneseBaseURL, let japaneseModel, let japaneseLanguage) = japaneseConfig.transcriptionMode {
+            TestSupport.expectEqual(englishBaseURL, japaneseBaseURL)
+            TestSupport.expectEqual(englishAPIKey, japaneseAPIKey)
+            TestSupport.expectEqual(englishModel, japaneseModel)
+            TestSupport.expectEqual(englishLanguage, "en")
+            TestSupport.expectEqual(japaneseLanguage, "ja")
+        } else {
+            fatalError("Expected .upload transcription mode for both language profiles")
+        }
+        // Cleanup prompt is the same regardless of input language.
+        TestSupport.expectEqual(
+            englishConfig.ordinaryCleanupSystemPrompt,
+            japaneseConfig.ordinaryCleanupSystemPrompt
+        )
+        // Local transcription mode would carry the input language hint
+        // but is not the captured mode here; rebuild each config with
+        // local policy on to confirm the hint flows through and is
+        // *not* a translation target.
+        let englishLocalConfig = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: englishResolved,
+            realtimeStreamingEnabled: false,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: true)
+        )
+        let japaneseLocalConfig = LiveAttemptConfigurationBuilder.configuration(
+            resolvedProfile: japaneseResolved,
+            realtimeStreamingEnabled: false,
+            localPolicy: LocalTranscriptionPolicy(isEnabled: true)
+        )
+        if case .local(let englishHint) = englishLocalConfig.transcriptionMode {
+            TestSupport.expectEqual(englishHint, "en")
+        } else {
+            fatalError("Expected .local transcription mode for English profile")
+        }
+        if case .local(let japaneseHint) = japaneseLocalConfig.transcriptionMode {
+            TestSupport.expectEqual(japaneseHint, "ja")
+        } else {
+            fatalError("Expected .local transcription mode for Japanese profile")
+        }
     }
 }

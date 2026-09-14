@@ -30,10 +30,12 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/LLMAPITransport.swift \
 	Sources/LLMCooldownManager.swift \
 	Sources/LanguageProfiles.swift \
+	Sources/LiveAttemptConfiguration.swift \
 	Sources/LocalParakeetModelManager.swift \
 	Sources/LocalParakeetTranscriptionService.swift \
 	Sources/LocalTranscriptionPolicy.swift \
 	Sources/ModelConfiguration.swift \
+	Sources/RealtimeTranscriptionService.swift \
 	Sources/TranscriptTextCore.swift \
 	Sources/UpdateManager.swift \
 	Sources/ShortcutCore/DictationShortcutSessionController.swift \
