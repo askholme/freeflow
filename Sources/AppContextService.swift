@@ -24,6 +24,21 @@ struct AppContext {
     var contextSummary: String {
         currentActivity
     }
+
+    static func disabledForUserPreference() -> AppContext {
+        AppContext(
+            appName: nil,
+            bundleIdentifier: nil,
+            windowTitle: nil,
+            selectedText: nil,
+            currentActivity: "Context prompt disabled in settings.",
+            contextSystemPrompt: nil,
+            contextPrompt: nil,
+            screenshotDataURL: nil,
+            screenshotMimeType: nil,
+            screenshotError: "Disabled by user preference"
+        )
+    }
 }
 
 final class AppContextService {

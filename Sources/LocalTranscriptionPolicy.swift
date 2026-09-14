@@ -1,7 +1,7 @@
 struct LocalTranscriptionPolicy: Equatable {
     let isEnabled: Bool
 
-    var allowsContextCapture: Bool { !isEnabled }
+    /// On-device transcription deliberately ignores realtime streaming: the
+    /// local recogniser emits a finished transcript on stop, not partials.
     var allowsRealtimeStreaming: Bool { !isEnabled }
-    var allowsLanguageModelProcessing: Bool { !isEnabled }
 }

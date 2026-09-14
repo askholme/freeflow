@@ -743,8 +743,6 @@ struct GeneralSettingsView: View {
                 SettingsCard("Cleanup", icon: "sparkles") {
                     cleanupSection
                 }
-                .disabled(appState.localTranscriptionEnabled)
-                .opacity(appState.localTranscriptionEnabled ? 0.55 : 1)
                 SettingsCard("Clipboard", icon: "doc.on.clipboard") {
                     clipboardSection
                 }
@@ -1285,6 +1283,19 @@ struct GeneralSettingsView: View {
                 .foregroundStyle(.secondary)
 
             Text("If Output Language is set, the transcript is still translated into that language, but the translation is literal: no rewording, no filler removal, no reformatting.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Divider()
+                .padding(.vertical, 4)
+
+            Toggle("Skip post-processing", isOn: $appState.disablePostProcessing)
+            Text("When on, the raw transcript is pasted without any LLM cleanup. Voice macros still apply, but Edit Mode, translation, and language-model post-processing are skipped. Independent of the context prompt toggle below.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Toggle("Skip context prompt", isOn: $appState.disableContextPrompt)
+            Text("When on, FreeFlow does not capture screenshots, selected text, or surrounding app/window context, and does not call the context-synthesis model. The cleanup LLM (if enabled above) still runs but with no surrounding context.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

@@ -11,6 +11,7 @@ struct FreeFlowTests {
         LocalParakeetModelStoreTests.run()
         await LocalParakeetTranscriptionServiceTests.run()
         LocalTranscriptionPolicyTests.run()
+        PipelineStageToggleTests.run()
         TranscriptTextCoreTests.run()
         print("FreeFlowTests passed")
     }

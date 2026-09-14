@@ -237,6 +237,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let realtimeStreamingModelStorageKey = "realtime_streaming_model"
     private let dictationAudioInterruptionEnabledStorageKey = "dictation_audio_interruption_enabled"
     private let localTranscriptionEnabledStorageKey = "local_transcription_enabled"
+    private let disablePostProcessingStorageKey = "disable_post_processing"
+    private let disableContextPromptStorageKey = "disable_context_prompt"
     private let pasteAfterShortcutReleaseDelay: TimeInterval = 0.03
     private let pressEnterAfterPasteDelay: TimeInterval = 0.08
     private let clipboardRestoreDelay: TimeInterval = 1.0
@@ -521,6 +523,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    @Published var disablePostProcessing: Bool {
+        didSet {
+            UserDefaults.standard.set(disablePostProcessing, forKey: disablePostProcessingStorageKey)
+        }
+    }
+
+    @Published var disableContextPrompt: Bool {
+        didSet {
+            UserDefaults.standard.set(disableContextPrompt, forKey: disableContextPromptStorageKey)
+        }
+    }
+
     @Published var keepDictationInClipboardHistory: Bool {
         didSet {
             UserDefaults.standard.set(keepDictationInClipboardHistory, forKey: keepDictationInClipboardHistoryStorageKey)
@@ -644,6 +658,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let transcriptionAPIURL = Self.loadOptionalStoredAPIValue(account: transcriptionAPIURLStorageKey)
         let transcriptionAPIKey = Self.loadStoredAPIKey(account: transcriptionAPIKeyStorageKey)
         let localTranscriptionEnabled = UserDefaults.standard.bool(forKey: localTranscriptionEnabledStorageKey)
+        let disablePostProcessing = UserDefaults.standard.bool(forKey: disablePostProcessingStorageKey)
+        let disableContextPrompt = UserDefaults.standard.bool(forKey: disableContextPromptStorageKey)
         let postProcessingModel = UserDefaults.standard.string(forKey: postProcessingModelStorageKey) ?? Self.defaultPostProcessingModel
         let postProcessingFallbackModel = Self.loadStoredPostProcessingFallbackModel(
             key: postProcessingFallbackModelStorageKey
@@ -750,6 +766,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.transcriptionAPIKey = transcriptionAPIKey
         self.transcriptionModel = transcriptionModel
         self.localTranscriptionEnabled = localTranscriptionEnabled
+        self.disablePostProcessing = disablePostProcessing
+        self.disableContextPrompt = disableContextPrompt
         self.postProcessingModel = postProcessingModel
         self.postProcessingFallbackModel = postProcessingFallbackModel
         self.contextModel = contextModel
@@ -1070,7 +1088,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     var requiresScreenRecordingPermission: Bool {
-        localTranscriptionPolicy.allowsContextCapture
+        // Screen recording is needed for context-prompt screenshots, which is a
+        // cleanup concern. It is therefore required whenever the user has not
+        // explicitly turned off context-prompt capture, independent of whether
+        // transcription is local or remote.
+        !disableContextPrompt
     }
 
     private func persistShortcut(_ binding: ShortcutBinding, key: String) {
@@ -1886,15 +1908,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     private func scheduleShortcutStart(mode: RecordingTriggerMode) {
         cancelPendingShortcutStart(resetMode: false)
-        if localTranscriptionPolicy.allowsContextCapture {
-            pendingSelectionSnapshot = contextService.collectSelectionSnapshot()
-            pendingManualCommandInvocation = hotkeyManager.currentPressedModifiers.contains(
-                commandModeManualModifier.shortcutModifier
-            )
-        } else {
-            pendingSelectionSnapshot = nil
-            pendingManualCommandInvocation = false
-        }
+        pendingSelectionSnapshot = contextService.collectSelectionSnapshot()
+        pendingManualCommandInvocation = hotkeyManager.currentPressedModifiers.contains(
+            commandModeManualModifier.shortcutModifier
+        )
         pendingShortcutStartMode = mode
         let delay = shortcutStartDelay
 
@@ -2048,13 +2065,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
             os_log(.info, log: recordingLog, "accessibility check passed: %.3fms", (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
         }
 
-        if localTranscriptionPolicy.isEnabled {
-            // On-device mode deliberately ignores Edit Mode and selected text:
-            // both would otherwise enter the cloud LLM/context path.
-            currentSessionIntent = .dictation
-            overlayManager.setRecordingTriggerMode(triggerMode, animated: false)
-            return true
-        }
+        // On-device mode no longer hard-blocks Edit Mode or selected-text
+        // handling. Those are cleanup concerns and the user can opt into them
+        // independently via Edit Mode setting, preserve-exact-wording, etc.
 
         let selectionSnapshot = selectionSnapshot ?? contextService.collectSelectionSnapshot()
         let manualCommandRequested = manualCommandRequested
@@ -2109,9 +2122,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
             prepareForMicrophonePermissionPrompt(
                 triggerMode: triggerMode,
-                selectionSnapshot: localTranscriptionPolicy.allowsContextCapture
-                    ? (pendingSelectionSnapshot ?? contextService.collectSelectionSnapshot())
-                    : nil,
+                selectionSnapshot: pendingSelectionSnapshot ?? contextService.collectSelectionSnapshot(),
                 manualCommandRequested: currentSessionIntent.isManualCommand
             )
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
@@ -2543,6 +2554,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case voiceMacro(command: String)
         case postProcessingSucceeded
         case postProcessingFailedFallback
+        case postProcessingSkippedByUserPreference
         case preservedExactWording
         case preservedExactWordingTranslated
         case preservedExactWordingTranslationFailedFallback
@@ -2561,6 +2573,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return isRetry
                     ? "Post-processing failed on retry, using raw transcript"
                     : "Post-processing failed, using raw transcript"
+            case .postProcessingSkippedByUserPreference:
+                return "Post-processing disabled in settings, using raw transcript"
             case .preservedExactWording:
                 return "Preserved exact wording, skipped post-processing"
             case .preservedExactWordingTranslated:
@@ -2591,15 +2605,26 @@ final class AppState: ObservableObject, @unchecked Sendable {
             return ("", .skippedEmptyRawTranscript, "")
         }
 
-        // On-device transcription is a hard privacy boundary, not merely a UI preset.
-        // Never let a stored Edit Mode/output-language setting route audio or
-        // text into the cloud pipeline. Deterministic voice macros remain local.
-        if !localTranscriptionPolicy.allowsLanguageModelProcessing {
-            if let macro = findMatchingMacro(for: trimmedRawTranscript) {
-                return (macro.payload, .voiceMacro(command: macro.command), "")
-            }
-            return (trimmedRawTranscript, .preservedExactWording, "")
+        // Voice macros are deterministic and local; always honour them, even when
+        // post-processing or context capture is disabled.
+        if let macro = findMatchingMacro(for: trimmedRawTranscript) {
+            os_log(.info, log: recordingLog, "Voice macro triggered: %{public}@", macro.command)
+            return (macro.payload, .voiceMacro(command: macro.command), "")
         }
+
+        // Post-processing disabled by user preference: skip the LLM cleanup step
+        // entirely. The raw transcript is pasted verbatim. Voice macros above
+        // still apply; Edit Mode / language-model cleanup do not.
+        if disablePostProcessing {
+            return (trimmedRawTranscript, .postProcessingSkippedByUserPreference, "")
+        }
+
+        // On-device transcription no longer hard-blocks cloud cleanup: the
+        // user can choose local transcription but still want LLM post-processing
+        // of the transcript. Voice macros always stay local; the rest of the
+        // pipeline (Edit Mode, translation, post-processing) is gated by the
+        // user's own toggles above (`disablePostProcessing`, `preserveExactWording`,
+        // Edit Mode setting, output language setting).
 
         if case .command(let invocation, let selectedText) = intent {
             do {
@@ -2615,11 +2640,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 os_log(.error, log: recordingLog, "Edit mode failed: %{public}@", error.localizedDescription)
                 return (selectedText, .commandModeFailedFallback(invocation: invocation), "")
             }
-        }
-
-        if let macro = findMatchingMacro(for: trimmedRawTranscript) {
-            os_log(.info, log: recordingLog, "Voice macro triggered: %{public}@", macro.command)
-            return (macro.payload, .voiceMacro(command: macro.command), "")
         }
 
         // Preserve-exact-wording mode. Two sub-cases so translation
@@ -2805,8 +2825,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         }
                     }
                     let appContext: AppContext
-                    if !self.localTranscriptionPolicy.allowsContextCapture {
-                        appContext = self.onDeviceContext()
+                    if self.disableContextPrompt {
+                        appContext = AppContext.disabledForUserPreference()
                     } else if let sessionContext {
                         appContext = sessionContext
                     } else if let inFlightContext = await inFlightContextTask?.value {
@@ -2924,8 +2944,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     }
                 } catch {
                     let resolvedContext: AppContext
-                    if !self.localTranscriptionPolicy.allowsContextCapture {
-                        resolvedContext = self.onDeviceContext()
+                    if self.disableContextPrompt {
+                        resolvedContext = AppContext.disabledForUserPreference()
                     } else if let sessionContext {
                         resolvedContext = sessionContext
                     } else if let inFlightContext = await inFlightContextTask?.value {
@@ -3054,18 +3074,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private func startContextCapture() {
-        guard localTranscriptionPolicy.allowsContextCapture else {
-            capturedContext = nil
+        // Context capture is a cleanup concern, not a transcription concern.
+        // It runs whenever the user has not explicitly turned it off, regardless
+        // of whether transcription is local or remote.
+        guard !disableContextPrompt else {
+            capturedContext = AppContext.disabledForUserPreference()
             contextCaptureTask = nil
-            lastContextSummary = "On-device transcription; app context is disabled."
+            lastContextSummary = "Context capture disabled in settings"
             lastContextScreenshotDataURL = nil
-            lastContextScreenshotStatus = "Disabled for on-device transcription"
+            lastContextScreenshotStatus = "Disabled in settings"
             lastContextAppName = ""
             lastContextBundleIdentifier = ""
             lastContextWindowTitle = ""
             lastContextSelectedText = ""
             lastContextLLMPrompt = ""
-            lastPostProcessingStatus = "Cloud processing disabled"
+            lastPostProcessingStatus = "Context capture disabled"
             return
         }
         contextCaptureTask?.cancel()
@@ -3110,21 +3133,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
             screenshotDataURL: nil,
             screenshotMimeType: nil,
             screenshotError: "No app context captured before stop"
-        )
-    }
-
-    private func onDeviceContext() -> AppContext {
-        AppContext(
-            appName: nil,
-            bundleIdentifier: nil,
-            windowTitle: nil,
-            selectedText: nil,
-            currentActivity: "On-device transcription; app context is disabled.",
-            contextSystemPrompt: nil,
-            contextPrompt: nil,
-            screenshotDataURL: nil,
-            screenshotMimeType: nil,
-            screenshotError: "Disabled for on-device transcription"
         )
     }
 
@@ -3177,7 +3185,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private func handleScreenshotCaptureIssue(_ message: String?) {
-        guard localTranscriptionPolicy.allowsContextCapture else { return }
+        // Context capture is a cleanup concern; it runs whenever the user has
+        // not turned it off, regardless of transcription mode.
+        guard !disableContextPrompt else { return }
         guard let message, !message.isEmpty else {
             hasShownScreenshotPermissionAlert = false
             return
