@@ -115,3 +115,20 @@ A change is complete only when:
   and a documented safe path.
 - Treat workflow changes as sensitive because code executed from `main` can
   access signing and notarization secrets in the release jobs.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked as local Markdown under `.scratch/`. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default canonical triage label vocabulary. See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository using root `CONTEXT.md` and system-wide
+`docs/adr/`. See `docs/agents/domain.md`.
