@@ -11,6 +11,7 @@ struct DictationShortcutEditor: View {
     @State private var holdValidationMessage: String?
     @State private var toggleValidationMessage: String?
     @State private var copyAgainValidationMessage: String?
+    @State private var switchLanguageValidationMessage: String?
 
     init(showsIntroText: Bool = true, onCaptureStateChange: ((Bool) -> Void)? = nil) {
         self.showsIntroText = showsIntroText
@@ -69,6 +70,23 @@ struct DictationShortcutEditor: View {
                     copyAgainValidationMessage = appState.setShortcut(binding, for: .copyAgain)
                 }
             )
+
+            ShortcutRoleSection(
+                role: .switchLanguage,
+                selection: appState.switchLanguageShortcut,
+                validationMessage: switchLanguageValidationMessage,
+                isCapturing: Binding(
+                    get: { activeCaptureRole == .switchLanguage },
+                    set: { activeCaptureRole = $0 ? .switchLanguage : nil }
+                ),
+                onSelect: { binding in
+                    switchLanguageValidationMessage = appState.setShortcut(binding, for: .switchLanguage)
+                }
+            )
+
+            Text("Switch Language cycles the Active Profile through your configured Languages order and shows a brief confirmation. Disabled by default.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             Text("Custom shortcuts can use regular keys, modifier-only shortcuts, or modifier combinations.")
                 .font(.caption)

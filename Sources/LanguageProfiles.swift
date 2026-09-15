@@ -629,6 +629,47 @@ enum LanguageProfiles {
         ))
     }
 
+    /// Advance the Active Profile to the next profile in configured
+    /// order, wrapping to the first profile after the last. This backs
+    /// the Switch Language shortcut's one-shot cycle action.
+    ///
+    /// With exactly one profile in the catalog there is no other
+    /// profile to cycle to, so the catalog (and its Active Profile) is
+    /// returned unchanged — but the returned `profile` still identifies
+    /// that single Active Profile so callers can show cycle-feedback
+    /// UI naming it even when selection did not change.
+    ///
+    /// Falls back to the same no-op behavior if `activeProfileID`
+    /// somehow does not identify a member of `profiles` (an invariant
+    /// violation `loadCatalog(from:)` never produces), matching
+    /// `LanguageProfileCatalog.activeProfile`'s total-accessor fallback.
+    static func cycleActiveProfile(
+        in catalog: LanguageProfileCatalog
+    ) -> (catalog: LanguageProfileCatalog, profile: LanguageProfile) {
+        guard catalog.profiles.count > 1,
+              let currentIndex = catalog.profiles.firstIndex(where: { $0.id == catalog.activeProfileID }) else {
+            return (catalog, catalog.activeProfile)
+        }
+        let nextIndex = (currentIndex + 1) % catalog.profiles.count
+        let nextProfile = catalog.profiles[nextIndex]
+        let newCatalog = LanguageProfileCatalog(
+            profiles: catalog.profiles,
+            activeProfileID: nextProfile.id
+        )
+        return (newCatalog, nextProfile)
+    }
+
+    /// Whether a Switch Language shortcut trigger must be ignored
+    /// because a Processing Attempt is currently in flight. A recording
+    /// or transcribing session must never have its configuration
+    /// mutated mid-flight, so the caller (`AppState`) must skip
+    /// `cycleActiveProfile`, skip persistence, and skip the cycle-
+    /// feedback overlay entirely — not queue the trigger for later —
+    /// whenever this returns `true`.
+    static func shouldRejectSwitchLanguageTrigger(isRecording: Bool, isTranscribing: Bool) -> Bool {
+        isRecording || isTranscribing
+    }
+
     /// Set the active profile by ID. Rejects an unknown ID so the UI
     /// cannot accidentally leave the catalog in an inconsistent state.
     static func selectProfile(

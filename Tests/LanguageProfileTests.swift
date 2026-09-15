@@ -74,6 +74,10 @@ enum LanguageProfileTests {
         testDeleteProfileRemovesCredentialOverride()
         testDeleteActiveProfileSelectsSuccessorInOrder()
         testDeleteLastProfileSelectsLastRemaining()
+        testCycleActiveProfileAdvancesToNextInOrder()
+        testCycleActiveProfileWrapsAtEnd()
+        testCycleActiveProfileSingleProfileIsNoOpButReportsProfile()
+        testShouldRejectSwitchLanguageTriggerBusyRejection()
         testSelectProfileSuccess()
         testSelectProfileRejectsUnknownID()
         testUpdateProfileOverridesTrimsAndPersists()
@@ -1254,6 +1258,88 @@ enum LanguageProfileTests {
         case .failure(let other):
             fatalError("Expected .unknownProfileID, got \(other)")
         }
+    }
+
+    // MARK: - Cycle active profile
+
+    private static func testCycleActiveProfileAdvancesToNextInOrder() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let thirdID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: firstID, name: "A", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: secondID, name: "B", inputLanguageCode: "da", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: thirdID, name: "C", inputLanguageCode: "fr", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: firstID
+        )
+
+        let advanceToSecond = LanguageProfiles.cycleActiveProfile(in: catalog)
+        TestSupport.expectEqual(advanceToSecond.catalog.activeProfileID, secondID)
+        TestSupport.expectEqual(advanceToSecond.profile.id, secondID)
+        // Profile order itself must be untouched by cycling.
+        TestSupport.expectEqual(advanceToSecond.catalog.profiles.map(\.id), [firstID, secondID, thirdID])
+
+        let advanceToThird = LanguageProfiles.cycleActiveProfile(in: advanceToSecond.catalog)
+        TestSupport.expectEqual(advanceToThird.catalog.activeProfileID, thirdID)
+        TestSupport.expectEqual(advanceToThird.profile.id, thirdID)
+    }
+
+    private static func testCycleActiveProfileWrapsAtEnd() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: firstID, name: "A", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: ""),
+                LanguageProfile(id: secondID, name: "B", inputLanguageCode: "da", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: secondID
+        )
+
+        let wrapped = LanguageProfiles.cycleActiveProfile(in: catalog)
+        TestSupport.expectEqual(wrapped.catalog.activeProfileID, firstID)
+        TestSupport.expectEqual(wrapped.profile.id, firstID)
+    }
+
+    private static func testCycleActiveProfileSingleProfileIsNoOpButReportsProfile() {
+        let onlyID = UUID()
+        let catalog = LanguageProfileCatalog(
+            profiles: [
+                LanguageProfile(id: onlyID, name: "Solo", inputLanguageCode: "en", transcriptionURLOverride: "", transcriptionModelOverride: "", realtimeModelOverride: "", postProcessingPromptOverride: "")
+            ],
+            activeProfileID: onlyID
+        )
+
+        let result = LanguageProfiles.cycleActiveProfile(in: catalog)
+        TestSupport.expectEqual(result.catalog, catalog)
+        TestSupport.expectEqual(result.profile.id, onlyID)
+        TestSupport.expectEqual(result.profile.name, "Solo")
+    }
+
+    /// The Switch Language shortcut trigger must be rejected — no
+    /// cycling, no persistence, no overlay — whenever a Processing
+    /// Attempt is in flight (recording, transcribing, or both). This is
+    /// the pure predicate `AppState.handleSwitchLanguageShortcutTriggered`
+    /// delegates to instead of inlining the busy check, so it is
+    /// deterministically testable outside the AppKit-dependent host.
+    private static func testShouldRejectSwitchLanguageTriggerBusyRejection() {
+        TestSupport.expect(
+            !LanguageProfiles.shouldRejectSwitchLanguageTrigger(isRecording: false, isTranscribing: false),
+            "Idle (not recording, not transcribing) must not reject the trigger"
+        )
+        TestSupport.expect(
+            LanguageProfiles.shouldRejectSwitchLanguageTrigger(isRecording: true, isTranscribing: false),
+            "Recording must reject the trigger"
+        )
+        TestSupport.expect(
+            LanguageProfiles.shouldRejectSwitchLanguageTrigger(isRecording: false, isTranscribing: true),
+            "Transcribing must reject the trigger"
+        )
+        TestSupport.expect(
+            LanguageProfiles.shouldRejectSwitchLanguageTrigger(isRecording: true, isTranscribing: true),
+            "Recording and transcribing simultaneously must reject the trigger"
+        )
     }
 
     // MARK: - Delete profile

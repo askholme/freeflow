@@ -212,9 +212,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let holdShortcutStorageKey = "hold_shortcut"
     private let toggleShortcutStorageKey = "toggle_shortcut"
     private let copyAgainShortcutStorageKey = "copy_again_shortcut"
+    private let switchLanguageShortcutStorageKey = "switch_language_shortcut"
     private let savedHoldCustomShortcutStorageKey = "saved_hold_custom_shortcut"
     private let savedToggleCustomShortcutStorageKey = "saved_toggle_custom_shortcut"
     private let savedCopyAgainCustomShortcutStorageKey = "saved_copy_again_custom_shortcut"
+    private let savedSwitchLanguageCustomShortcutStorageKey = "saved_switch_language_custom_shortcut"
     private let customVocabularyStorageKey = "custom_vocabulary"
     private let transcriptionLanguageStorageKey = "transcription_language"
     private let selectedMicrophoneStorageKey = "selected_microphone_id"
@@ -344,6 +346,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    @Published var switchLanguageShortcut: ShortcutBinding {
+        didSet {
+            persistShortcut(switchLanguageShortcut, key: switchLanguageShortcutStorageKey)
+            restartHotkeyMonitoring()
+        }
+    }
+
     @Published private(set) var savedHoldCustomShortcut: ShortcutBinding? {
         didSet {
             persistOptionalShortcut(savedHoldCustomShortcut, key: savedHoldCustomShortcutStorageKey)
@@ -359,6 +368,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published private(set) var savedCopyAgainCustomShortcut: ShortcutBinding? {
         didSet {
             persistOptionalShortcut(savedCopyAgainCustomShortcut, key: savedCopyAgainCustomShortcutStorageKey)
+        }
+    }
+
+    @Published private(set) var savedSwitchLanguageCustomShortcut: ShortcutBinding? {
+        didSet {
+            persistOptionalShortcut(savedSwitchLanguageCustomShortcut, key: savedSwitchLanguageCustomShortcutStorageKey)
         }
     }
 
@@ -668,7 +683,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let shortcuts = Self.loadShortcutConfiguration(
             holdKey: holdShortcutStorageKey,
             toggleKey: toggleShortcutStorageKey,
-            copyAgainKey: copyAgainShortcutStorageKey
+            copyAgainKey: copyAgainShortcutStorageKey,
+            switchLanguageKey: switchLanguageShortcutStorageKey
         )
         let savedHoldCustomShortcut = Self.loadSavedCustomShortcut(
             forKey: savedHoldCustomShortcutStorageKey,
@@ -681,6 +697,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let savedCopyAgainCustomShortcut = Self.loadSavedCustomShortcut(
             forKey: savedCopyAgainCustomShortcutStorageKey,
             fallback: shortcuts.copyAgain.isCustom ? shortcuts.copyAgain : nil
+        )
+        let savedSwitchLanguageCustomShortcut = Self.loadSavedCustomShortcut(
+            forKey: savedSwitchLanguageCustomShortcutStorageKey,
+            fallback: shortcuts.switchLanguage.isCustom ? shortcuts.switchLanguage : nil
         )
         let customVocabulary = UserDefaults.standard.string(forKey: customVocabularyStorageKey) ?? ""
         let transcriptionLanguage = Self.normalizeTranscriptionLanguage(
@@ -788,9 +808,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.holdShortcut = shortcuts.hold
         self.toggleShortcut = shortcuts.toggle
         self.copyAgainShortcut = shortcuts.copyAgain
+        self.switchLanguageShortcut = shortcuts.switchLanguage
         self.savedHoldCustomShortcut = savedHoldCustomShortcut.binding
         self.savedToggleCustomShortcut = savedToggleCustomShortcut.binding
         self.savedCopyAgainCustomShortcut = savedCopyAgainCustomShortcut.binding
+        self.savedSwitchLanguageCustomShortcut = savedSwitchLanguageCustomShortcut.binding
         self.isCommandModeEnabled = isCommandModeEnabled
         self.commandModeStyle = commandModeStyle
         self.commandModeManualModifier = commandModeManualModifier
@@ -833,6 +855,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         if shortcuts.didUpdateCopyAgainStoredValue {
             persistShortcut(shortcuts.copyAgain, key: copyAgainShortcutStorageKey)
         }
+        if shortcuts.didUpdateSwitchLanguageStoredValue {
+            persistShortcut(shortcuts.switchLanguage, key: switchLanguageShortcutStorageKey)
+        }
         if savedHoldCustomShortcut.didUpdateStoredValue {
             persistOptionalShortcut(savedHoldCustomShortcut.binding, key: savedHoldCustomShortcutStorageKey)
         }
@@ -841,6 +866,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
         if savedCopyAgainCustomShortcut.didUpdateStoredValue {
             persistOptionalShortcut(savedCopyAgainCustomShortcut.binding, key: savedCopyAgainCustomShortcutStorageKey)
+        }
+        if savedSwitchLanguageCustomShortcut.didUpdateStoredValue {
+            persistOptionalShortcut(savedSwitchLanguageCustomShortcut.binding, key: savedSwitchLanguageCustomShortcutStorageKey)
         }
 
         if loadedLanguageProfileCatalog.didRepairStoredValue {
@@ -897,9 +925,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let hold: ShortcutBinding
         let toggle: ShortcutBinding
         let copyAgain: ShortcutBinding
+        let switchLanguage: ShortcutBinding
         let didUpdateHoldStoredValue: Bool
         let didUpdateToggleStoredValue: Bool
         let didUpdateCopyAgainStoredValue: Bool
+        let didUpdateSwitchLanguageStoredValue: Bool
     }
 
     private struct StoredOptionalShortcut {
@@ -951,7 +981,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private static func loadShortcutConfiguration(
         holdKey: String,
         toggleKey: String,
-        copyAgainKey: String
+        copyAgainKey: String,
+        switchLanguageKey: String
     ) -> StoredShortcutConfiguration {
         let legacyPreset = ShortcutPreset(
             rawValue: UserDefaults.standard.string(forKey: "hotkey_option") ?? ShortcutPreset.fnKey.rawValue
@@ -961,13 +992,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let storedHold = loadShortcut(forKey: holdKey)
         let storedToggle = loadShortcut(forKey: toggleKey)
         let storedCopyAgain = loadShortcut(forKey: copyAgainKey)
+        let storedSwitchLanguage = loadShortcut(forKey: switchLanguageKey)
         return StoredShortcutConfiguration(
             hold: storedHold.binding ?? hold,
             toggle: storedToggle.binding ?? toggle,
             copyAgain: storedCopyAgain.binding ?? .disabled,
+            switchLanguage: storedSwitchLanguage.binding ?? .disabled,
             didUpdateHoldStoredValue: storedHold.binding == nil || storedHold.didNormalize,
             didUpdateToggleStoredValue: storedToggle.binding == nil || storedToggle.didNormalize,
-            didUpdateCopyAgainStoredValue: storedCopyAgain.didNormalize
+            didUpdateCopyAgainStoredValue: storedCopyAgain.didNormalize,
+            didUpdateSwitchLanguageStoredValue: storedSwitchLanguage.didNormalize
         )
     }
 
@@ -1851,7 +1885,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     var usesFnShortcut: Bool {
-        holdShortcut.usesFnKey || toggleShortcut.usesFnKey || copyAgainShortcut.usesFnKey
+        holdShortcut.usesFnKey || toggleShortcut.usesFnKey || copyAgainShortcut.usesFnKey || switchLanguageShortcut.usesFnKey
     }
 
     var hasEnabledHoldShortcut: Bool {
@@ -1891,6 +1925,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             return savedToggleCustomShortcut
         case .copyAgain:
             return savedCopyAgainCustomShortcut
+        case .switchLanguage:
+            return savedSwitchLanguageCustomShortcut
         }
     }
 
@@ -1941,6 +1977,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         if role != .copyAgain, binding.conflicts(with: copyAgainShortcut) {
             return "This shortcut is already used by Paste Again."
         }
+        if role != .switchLanguage, binding.conflicts(with: switchLanguageShortcut) {
+            return "This shortcut is already used by Switch Language."
+        }
         if role == .copyAgain {
             if binding.conflicts(with: holdShortcut) {
                 return "Paste Again cannot share a shortcut with Hold to Talk."
@@ -1951,6 +1990,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
             if isCommandModeEnabled, commandModeStyle == .manual,
                bindingCollides(binding, with: commandModeManualModifier) {
                 return "Paste Again cannot share the Edit Mode modifier."
+            }
+        }
+        if role == .switchLanguage {
+            if binding.conflicts(with: holdShortcut) {
+                return "Switch Language cannot share a shortcut with Hold to Talk."
+            }
+            if binding.conflicts(with: toggleShortcut) {
+                return "Switch Language cannot share a shortcut with Tap to Toggle."
+            }
+            if isCommandModeEnabled, commandModeStyle == .manual,
+               bindingCollides(binding, with: commandModeManualModifier) {
+                return "Switch Language cannot share the Edit Mode modifier."
             }
         }
 
@@ -1970,6 +2021,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 savedCopyAgainCustomShortcut = binding
             }
             copyAgainShortcut = binding
+        case .switchLanguage:
+            if binding.isCustom {
+                savedSwitchLanguageCustomShortcut = binding
+            }
+            switchLanguageShortcut = binding
         }
 
         return nil
@@ -1979,11 +2035,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         for modifier: CommandModeManualModifier,
         holdBinding: ShortcutBinding? = nil,
         toggleBinding: ShortcutBinding? = nil,
-        copyAgainBinding: ShortcutBinding? = nil
+        copyAgainBinding: ShortcutBinding? = nil,
+        switchLanguageBinding: ShortcutBinding? = nil
     ) -> String? {
         let holdBinding = holdBinding ?? holdShortcut
         let toggleBinding = toggleBinding ?? toggleShortcut
         let copyAgainBinding = copyAgainBinding ?? copyAgainShortcut
+        let switchLanguageBinding = switchLanguageBinding ?? switchLanguageShortcut
         let manualModifier = modifier.shortcutModifier
 
         if !holdBinding.isDisabled && holdBinding.modifiers.contains(manualModifier) {
@@ -1994,6 +2052,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
         if !copyAgainBinding.isDisabled && copyAgainBinding.modifiers.contains(manualModifier) {
             return "That modifier is already part of the Paste Again shortcut."
+        }
+        if !switchLanguageBinding.isDisabled && switchLanguageBinding.modifiers.contains(manualModifier) {
+            return "That modifier is already part of the Switch Language shortcut."
         }
         // Modifier-only bindings carry identity in keyCode, not modifiers.
         if !holdBinding.isDisabled,
@@ -2013,6 +2074,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
            let bindingModifier = ShortcutBinding.modifier(forKeyCode: copyAgainBinding.keyCode),
            bindingModifier == manualModifier {
             return "That modifier is already the Paste Again shortcut."
+        }
+        if !switchLanguageBinding.isDisabled,
+           switchLanguageBinding.kind == .modifierKey,
+           let bindingModifier = ShortcutBinding.modifier(forKeyCode: switchLanguageBinding.keyCode),
+           bindingModifier == manualModifier {
+            return "That modifier is already the Switch Language shortcut."
         }
 
         return nil
@@ -2073,6 +2140,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             hold: holdShortcut,
             toggle: toggleShortcut,
             copyAgain: copyAgainShortcut,
+            switchLanguage: switchLanguageShortcut,
             permittedAdditionalExactMatchModifiers: permittedAdditionalExactMatchModifiers
         )
     }
@@ -2095,6 +2163,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private func handleShortcutEvent(_ event: ShortcutEvent) {
         if event == .copyAgainTriggered {
             copyLastTranscriptToPasteboard()
+            return
+        }
+        if event == .switchLanguageTriggered {
+            handleSwitchLanguageShortcutTriggered()
             return
         }
 
@@ -2148,6 +2220,30 @@ final class AppState: ObservableObject, @unchecked Sendable {
         pasteAtCursorWhenShortcutReleased { [weak self] in
             self?.restoreClipboardIfNeeded(pendingClipboardRestore)
         }
+    }
+
+    /// Handle the matched Switch Language shortcut event. Ignored
+    /// entirely — no queuing, no state change, no overlay — while a
+    /// Processing Attempt is in flight, per the pure, deterministically
+    /// tested `LanguageProfiles.shouldRejectSwitchLanguageTrigger(isRecording:isTranscribing:)`
+    /// predicate, so the shortcut can never mutate configuration
+    /// mid-flight. Otherwise cycles the Active Profile to the next
+    /// profile in configured order (wrapping at the end; a no-op
+    /// selection that still reports the single profile when only one
+    /// exists), persists the change through the same
+    /// `persistLanguageProfiles` path `selectLanguageProfile` already
+    /// uses so it takes effect for the next Physical Recording, and
+    /// shows brief non-activating overlay feedback naming the resulting
+    /// Active Profile.
+    private func handleSwitchLanguageShortcutTriggered() {
+        guard !LanguageProfiles.shouldRejectSwitchLanguageTrigger(
+            isRecording: isRecording,
+            isTranscribing: isTranscribing
+        ) else { return }
+        let result = LanguageProfiles.cycleActiveProfile(in: languageProfileCatalog)
+        languageProfileCatalog = result.catalog
+        persistLanguageProfiles(result.catalog)
+        overlayManager.showLanguageProfileSwitched(result.profile.name)
     }
 
     func toggleRecording() {

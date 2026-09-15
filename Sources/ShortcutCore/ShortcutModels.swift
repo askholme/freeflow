@@ -56,12 +56,14 @@ enum ShortcutRole {
     case hold
     case toggle
     case copyAgain
+    case switchLanguage
 
     var title: String {
         switch self {
         case .hold: return "Hold to Talk"
         case .toggle: return "Tap to Toggle"
         case .copyAgain: return "Paste Again"
+        case .switchLanguage: return "Switch Language"
         }
     }
 }
@@ -72,27 +74,31 @@ enum ShortcutEvent: Equatable {
     case toggleActivated
     case toggleDeactivated
     case copyAgainTriggered
+    case switchLanguageTriggered
 }
 
 struct ShortcutConfiguration: Equatable {
     let hold: ShortcutBinding
     let toggle: ShortcutBinding
     let copyAgain: ShortcutBinding
+    let switchLanguage: ShortcutBinding
     let permittedAdditionalExactMatchModifiers: ShortcutModifiers
 
     init(
         hold: ShortcutBinding,
         toggle: ShortcutBinding,
         copyAgain: ShortcutBinding = .disabled,
+        switchLanguage: ShortcutBinding = .disabled,
         permittedAdditionalExactMatchModifiers: ShortcutModifiers = []
     ) {
         self.hold = hold
         self.toggle = toggle
         self.copyAgain = copyAgain
+        self.switchLanguage = switchLanguage
         self.permittedAdditionalExactMatchModifiers = permittedAdditionalExactMatchModifiers
     }
 
-    static let disabled = ShortcutConfiguration(hold: .disabled, toggle: .disabled, copyAgain: .disabled)
+    static let disabled = ShortcutConfiguration(hold: .disabled, toggle: .disabled, copyAgain: .disabled, switchLanguage: .disabled)
 }
 
 enum ShortcutPreset: String, CaseIterable, Identifiable, Codable {

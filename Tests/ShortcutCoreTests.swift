@@ -15,6 +15,14 @@ enum ShortcutCoreTests {
         testHoldSessionControllerLifecycle()
         testToggleSessionControllerLifecycle()
         testHoldToToggleSessionControllerLifecycle()
+        testSwitchLanguageDisabledByDefault()
+        testSwitchLanguageFiresOnLeadingEdgeOnly()
+        testSwitchLanguageCollisionDetection()
+        testSwitchLanguagePressedInputAccounting()
+        testSwitchLanguageEventConsumption()
+        testSwitchLanguageNeverMutatesDictationSession()
+        testSwitchLanguageModifierOnlyBindingSideSpecificity()
+        testSwitchLanguageExactModifierMatching()
     }
 
     private static func testBareFnHoldLifecycle() {
@@ -343,5 +351,388 @@ enum ShortcutCoreTests {
         controller.reset()
         TestSupport.expectEqual(controller.activeMode, nil)
         TestSupport.expectEqual(controller.toggleStopArmed, false)
+    }
+
+    // MARK: - Switch Language
+
+    private static func testSwitchLanguageDisabledByDefault() {
+        TestSupport.expect(
+            ShortcutConfiguration.disabled.switchLanguage.isDisabled,
+            "The shared disabled configuration must keep Switch Language disabled"
+        )
+        TestSupport.expect(
+            ShortcutConfiguration(hold: .defaultHold, toggle: .defaultToggle).switchLanguage.isDisabled,
+            "Switch Language must default to disabled when a caller omits it, matching Paste Again"
+        )
+    }
+
+    private static func testSwitchLanguageFiresOnLeadingEdgeOnly() {
+        let binding = ShortcutBinding(
+            keyCode: 97,
+            keyDisplay: "F6",
+            modifiers: [],
+            kind: .key,
+            preset: nil
+        )
+        let configuration = ShortcutConfiguration(hold: .disabled, toggle: .disabled, switchLanguage: binding)
+        let firstDown = ShortcutMatcher.reduce(
+            state: ShortcutInputState(),
+            event: .keyChanged(keyCode: 97, isDown: true, isRepeat: false),
+            configuration: configuration
+        )
+        let repeated = ShortcutMatcher.reduce(
+            state: firstDown.state,
+            event: .keyChanged(keyCode: 97, isDown: true, isRepeat: true),
+            configuration: configuration
+        )
+        let up = ShortcutMatcher.reduce(
+            state: repeated.state,
+            event: .keyChanged(keyCode: 97, isDown: false, isRepeat: false),
+            configuration: configuration
+        )
+        let secondDown = ShortcutMatcher.reduce(
+            state: up.state,
+            event: .keyChanged(keyCode: 97, isDown: true, isRepeat: false),
+            configuration: configuration
+        )
+
+        TestSupport.expectEqual(firstDown.emittedEvents, [.switchLanguageTriggered])
+        TestSupport.expectEqual(repeated.emittedEvents, [])
+        TestSupport.expectEqual(up.emittedEvents, [])
+        TestSupport.expectEqual(secondDown.emittedEvents, [.switchLanguageTriggered])
+    }
+
+    private static func testSwitchLanguageCollisionDetection() {
+        let switchLanguage = ShortcutBinding(
+            keyCode: 97,
+            keyDisplay: "F6",
+            modifiers: [.command],
+            kind: .key,
+            preset: nil
+        )
+        let sameKeyAndModifiers = ShortcutBinding(
+            keyCode: 97,
+            keyDisplay: "F6",
+            modifiers: [.command],
+            kind: .key,
+            preset: nil
+        )
+        let differentKey = ShortcutBinding(
+            keyCode: 98,
+            keyDisplay: "F7",
+            modifiers: [.command],
+            kind: .key,
+            preset: nil
+        )
+
+        TestSupport.expect(
+            switchLanguage.conflicts(with: sameKeyAndModifiers),
+            "Switch Language must conflict with an equivalent hold/toggle/copyAgain-style binding"
+        )
+        TestSupport.expect(
+            sameKeyAndModifiers.conflicts(with: switchLanguage),
+            "Conflict detection against Switch Language must be symmetric"
+        )
+        TestSupport.expect(
+            !switchLanguage.conflicts(with: differentKey),
+            "Switch Language must not conflict with a binding on a different key"
+        )
+        TestSupport.expect(
+            !switchLanguage.conflicts(with: .disabled),
+            "A disabled binding must never conflict with Switch Language"
+        )
+        TestSupport.expect(
+            !ShortcutBinding.disabled.conflicts(with: switchLanguage),
+            "Switch Language must never conflict with a disabled binding (symmetric)"
+        )
+
+        // Prove Switch Language sits in the same conflict-detection
+        // universe as the other three roles, not just against an
+        // anonymous binding: assign the identical key+modifiers to
+        // every role of a real `ShortcutConfiguration` (the same struct
+        // `AppState.activeShortcutConfiguration`/`setShortcut` build
+        // from `hold`/`toggle`/`copyAgain`/`switchLanguage`) and confirm
+        // `.switchLanguage` conflicts, in both directions, against each
+        // of `.hold`, `.toggle`, and `.copyAgain` individually.
+        let sharedKeyAndModifiers = ShortcutBinding(
+            keyCode: 99,
+            keyDisplay: "F8",
+            modifiers: [.option],
+            kind: .key,
+            preset: nil
+        )
+        let configuration = ShortcutConfiguration(
+            hold: sharedKeyAndModifiers,
+            toggle: sharedKeyAndModifiers,
+            copyAgain: sharedKeyAndModifiers,
+            switchLanguage: sharedKeyAndModifiers
+        )
+
+        TestSupport.expect(
+            configuration.switchLanguage.conflicts(with: configuration.hold),
+            "Switch Language must conflict with an equivalent Hold to Talk binding"
+        )
+        TestSupport.expect(
+            configuration.hold.conflicts(with: configuration.switchLanguage),
+            "Hold to Talk vs Switch Language conflict detection must be symmetric"
+        )
+        TestSupport.expect(
+            configuration.switchLanguage.conflicts(with: configuration.toggle),
+            "Switch Language must conflict with an equivalent Tap to Toggle binding"
+        )
+        TestSupport.expect(
+            configuration.toggle.conflicts(with: configuration.switchLanguage),
+            "Tap to Toggle vs Switch Language conflict detection must be symmetric"
+        )
+        TestSupport.expect(
+            configuration.switchLanguage.conflicts(with: configuration.copyAgain),
+            "Switch Language must conflict with an equivalent Paste Again binding"
+        )
+        TestSupport.expect(
+            configuration.copyAgain.conflicts(with: configuration.switchLanguage),
+            "Paste Again vs Switch Language conflict detection must be symmetric"
+        )
+    }
+
+    private static func testSwitchLanguagePressedInputAccounting() {
+        let binding = ShortcutBinding(
+            keyCode: 97,
+            keyDisplay: "F6",
+            modifiers: [],
+            kind: .key,
+            preset: nil
+        )
+        let configuration = ShortcutConfiguration(hold: .disabled, toggle: .disabled, switchLanguage: binding)
+
+        var state = ShortcutInputState()
+        TestSupport.expect(
+            !state.hasPressedShortcutInputs(configuration: configuration),
+            "No inputs pressed yet must report no pressed shortcut inputs"
+        )
+
+        state.pressedKeyCodes.insert(97)
+        TestSupport.expect(
+            state.hasPressedShortcutInputs(configuration: configuration),
+            "Holding the Switch Language key must count as a pressed shortcut input"
+        )
+    }
+
+    private static func testSwitchLanguageEventConsumption() {
+        let binding = ShortcutBinding(
+            keyCode: 97,
+            keyDisplay: "F6",
+            modifiers: [],
+            kind: .key,
+            preset: nil
+        )
+        let configuration = ShortcutConfiguration(hold: .disabled, toggle: .disabled, switchLanguage: binding)
+
+        let down = ShortcutMatcher.reduce(
+            state: ShortcutInputState(),
+            event: .keyChanged(keyCode: 97, isDown: true, isRepeat: false),
+            configuration: configuration
+        )
+        TestSupport.expectEqual(down.consumeDecision, .consume)
+
+        let unrelatedKey = ShortcutMatcher.reduce(
+            state: ShortcutInputState(),
+            event: .keyChanged(keyCode: 55, isDown: true, isRepeat: false),
+            configuration: configuration
+        )
+        TestSupport.expectEqual(unrelatedKey.emittedEvents, [])
+        TestSupport.expectEqual(unrelatedKey.consumeDecision, .passthrough)
+    }
+
+    /// The matched `.switchLanguageTriggered` event must never reach the
+    /// dictation session controller in a way that starts, stops, or
+    /// otherwise mutates recording state — regardless of whether the
+    /// controller is idle, mid-hold, or mid-toggle, and regardless of
+    /// `isTranscribing`. Mirrors the same isolation contract already
+    /// covered for `.copyAgainTriggered`.
+    private static func testSwitchLanguageNeverMutatesDictationSession() {
+        let idleController = DictationShortcutSessionController()
+        TestSupport.expectEqual(
+            idleController.handle(event: .switchLanguageTriggered, isTranscribing: false),
+            nil
+        )
+        TestSupport.expectEqual(idleController.activeMode, nil)
+
+        let idleWhileTranscribing = DictationShortcutSessionController()
+        TestSupport.expectEqual(
+            idleWhileTranscribing.handle(event: .switchLanguageTriggered, isTranscribing: true),
+            nil
+        )
+        TestSupport.expectEqual(idleWhileTranscribing.activeMode, nil)
+
+        let holdController = DictationShortcutSessionController()
+        TestSupport.expectEqual(holdController.handle(event: .holdActivated, isTranscribing: false), .start(.hold))
+        TestSupport.expectEqual(
+            holdController.handle(event: .switchLanguageTriggered, isTranscribing: false),
+            nil
+        )
+        TestSupport.expectEqual(holdController.activeMode, .hold)
+
+        let toggleController = DictationShortcutSessionController()
+        TestSupport.expectEqual(toggleController.handle(event: .toggleActivated, isTranscribing: false), .start(.toggle))
+        TestSupport.expectEqual(
+            toggleController.handle(event: .switchLanguageTriggered, isTranscribing: false),
+            nil
+        )
+        TestSupport.expectEqual(toggleController.activeMode, .toggle)
+    }
+
+    /// Modifier-only (`.modifierKey`-kind) Switch Language bindings must
+    /// be side-specific like the existing `ShortcutPreset.rightOption`
+    /// hold binding (`testRightOptionPresetIsSideSpecific`), must fire
+    /// the one-shot `.switchLanguageTriggered` event and consume the
+    /// matching side's modifier event, and must be reflected correctly
+    /// by `hasPressedShortcutInputs` for pressed-input accounting.
+    private static func testSwitchLanguageModifierOnlyBindingSideSpecificity() {
+        let configuration = ShortcutConfiguration(
+            hold: .disabled,
+            toggle: .disabled,
+            switchLanguage: ShortcutPreset.rightOption.binding
+        )
+
+        let leftOption = ShortcutMatcher.reduce(
+            state: ShortcutInputState(),
+            event: .modifierChanged(keyCode: 58, isDown: true),
+            configuration: configuration
+        )
+        let rightOption = ShortcutMatcher.reduce(
+            state: ShortcutInputState(),
+            event: .modifierChanged(keyCode: 61, isDown: true),
+            configuration: configuration
+        )
+
+        TestSupport.expectEqual(leftOption.emittedEvents, [])
+        TestSupport.expectEqual(leftOption.consumeDecision, .passthrough)
+        TestSupport.expectEqual(rightOption.emittedEvents, [.switchLanguageTriggered])
+        TestSupport.expectEqual(rightOption.consumeDecision, .consume)
+
+        TestSupport.expect(
+            !leftOption.state.hasPressedShortcutInputs(configuration: configuration),
+            "Holding the non-matching Left Option modifier must not count as a pressed Switch Language input"
+        )
+        TestSupport.expect(
+            rightOption.state.hasPressedShortcutInputs(configuration: configuration),
+            "Holding the exact Right Option modifier must count as a pressed Switch Language input"
+        )
+
+        // Leading-edge only: releasing and re-pressing Right Option must
+        // retrigger exactly once each time, never on repeated down state.
+        let rightOptionStillDown = ShortcutMatcher.reduce(
+            state: rightOption.state,
+            event: .modifierChanged(keyCode: 61, isDown: true),
+            configuration: configuration
+        )
+        TestSupport.expectEqual(rightOptionStillDown.emittedEvents, [])
+
+        let rightOptionUp = ShortcutMatcher.reduce(
+            state: rightOptionStillDown.state,
+            event: .modifierChanged(keyCode: 61, isDown: false),
+            configuration: configuration
+        )
+        TestSupport.expectEqual(rightOptionUp.emittedEvents, [])
+        TestSupport.expect(
+            !rightOptionUp.state.hasPressedShortcutInputs(configuration: configuration),
+            "Releasing Right Option must clear the pressed Switch Language input"
+        )
+
+        let rightOptionDownAgain = ShortcutMatcher.reduce(
+            state: rightOptionUp.state,
+            event: .modifierChanged(keyCode: 61, isDown: true),
+            configuration: configuration
+        )
+        TestSupport.expectEqual(rightOptionDownAgain.emittedEvents, [.switchLanguageTriggered])
+    }
+
+    /// Exact-modifier-match Switch Language bindings must honor the same
+    /// left/right-specific and `permittedAdditionalExactMatchModifiers`
+    /// rules already covered for hold in
+    /// `testReducerHonorsExactModifierMatching`, including pressed-input
+    /// accounting and event consumption for the matching case.
+    private static func testSwitchLanguageExactModifierMatching() {
+        let binding = ShortcutBinding(
+            keyCode: 96,
+            keyDisplay: "F5",
+            modifiers: [.command],
+            kind: .key,
+            preset: nil,
+            exactModifierKeyCodes: [55]
+        )
+        let configuration = ShortcutConfiguration(hold: .disabled, toggle: .disabled, switchLanguage: binding)
+
+        // Pressed-input accounting on modifier state alone (before the
+        // Switch Language key itself is ever pressed) exercises
+        // `referencesPressedModifiers`'s exact-match branch directly:
+        // only the exact left-Command modifier code should reference
+        // this binding, not right Command. (Once the bound key itself
+        // is physically down, `hasPressedShortcutInputs` reports true
+        // regardless of modifiers — it accounts for the raw key
+        // reference, not full-binding activation — so that check
+        // belongs here, on modifier-only state, not after a key press.)
+        let rightCommandModifierOnly = ShortcutMatcher.reduce(
+            state: ShortcutInputState(),
+            event: .modifierChanged(keyCode: 54, isDown: true),
+            configuration: configuration
+        ).state
+        TestSupport.expect(
+            !rightCommandModifierOnly.hasPressedShortcutInputs(configuration: configuration),
+            "Right Command alone does not reference an exact left-Command Switch Language binding"
+        )
+
+        let leftCommandModifierOnly = ShortcutMatcher.reduce(
+            state: ShortcutInputState(),
+            event: .modifierChanged(keyCode: 55, isDown: true),
+            configuration: configuration
+        ).state
+        TestSupport.expect(
+            leftCommandModifierOnly.hasPressedShortcutInputs(configuration: configuration),
+            "The exact left-Command modifier alone must reference the Switch Language binding"
+        )
+
+        let rightCommandState = rightCommandModifierOnly
+        let rightCommandKey = ShortcutMatcher.reduce(
+            state: rightCommandState,
+            event: .keyChanged(keyCode: 96, isDown: true, isRepeat: false),
+            configuration: configuration
+        )
+        TestSupport.expectEqual(rightCommandKey.emittedEvents, [])
+        TestSupport.expectEqual(rightCommandKey.consumeDecision, .passthrough)
+
+        let leftCommandState = leftCommandModifierOnly
+        let leftCommandKey = ShortcutMatcher.reduce(
+            state: leftCommandState,
+            event: .keyChanged(keyCode: 96, isDown: true, isRepeat: false),
+            configuration: configuration
+        )
+        TestSupport.expectEqual(leftCommandKey.emittedEvents, [.switchLanguageTriggered])
+        TestSupport.expectEqual(leftCommandKey.consumeDecision, .consume)
+
+        let shiftedState = ShortcutMatcher.reduce(
+            state: leftCommandState,
+            event: .modifierChanged(keyCode: 56, isDown: true),
+            configuration: configuration
+        ).state
+        let shiftedKey = ShortcutMatcher.reduce(
+            state: shiftedState,
+            event: .keyChanged(keyCode: 96, isDown: true, isRepeat: false),
+            configuration: configuration
+        )
+        TestSupport.expectEqual(shiftedKey.emittedEvents, [])
+
+        let permittedConfiguration = ShortcutConfiguration(
+            hold: .disabled,
+            toggle: .disabled,
+            switchLanguage: binding,
+            permittedAdditionalExactMatchModifiers: [.shift]
+        )
+        let permittedKey = ShortcutMatcher.reduce(
+            state: shiftedState,
+            event: .keyChanged(keyCode: 96, isDown: true, isRepeat: false),
+            configuration: permittedConfiguration
+        )
+        TestSupport.expectEqual(permittedKey.emittedEvents, [.switchLanguageTriggered])
     }
 }

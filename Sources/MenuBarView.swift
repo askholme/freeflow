@@ -320,6 +320,70 @@ struct MenuBarView: View {
                 }
             }
 
+            Menu("Switch Language Shortcut") {
+                Button {
+                    _ = appState.setShortcut(.disabled, for: .switchLanguage)
+                } label: {
+                    if appState.switchLanguageShortcut.isDisabled {
+                        Text("✓ Disabled")
+                    } else {
+                        Text("  Disabled")
+                    }
+                }
+
+                ForEach(ShortcutPreset.allCases) { preset in
+                    Button {
+                        _ = appState.setShortcut(preset.binding, for: .switchLanguage)
+                    } label: {
+                        if appState.switchLanguageShortcut == preset.binding {
+                            Text("✓ \(preset.title)")
+                        } else {
+                            Text("  \(preset.title)")
+                        }
+                    }
+                    .disabled(preset.binding == appState.holdShortcut || preset.binding == appState.toggleShortcut)
+                }
+
+                if let savedCustomShortcut = appState.savedCustomShortcut(for: .switchLanguage) {
+                    Divider()
+                    Button {
+                        _ = appState.setShortcut(savedCustomShortcut, for: .switchLanguage)
+                    } label: {
+                        if appState.switchLanguageShortcut == savedCustomShortcut {
+                            Text("✓ Custom: \(savedCustomShortcut.displayName)")
+                        } else {
+                            Text("  Custom: \(savedCustomShortcut.displayName)")
+                        }
+                    }
+                }
+
+                Divider()
+                Button("Customize…") {
+                    appState.selectedSettingsTab = .general
+                    NotificationCenter.default.post(name: .showSettings, object: nil)
+                }
+            }
+
+            Menu("Language: \(appState.languageProfileCatalog.activeProfile.name)") {
+                ForEach(appState.languageProfileCatalog.profiles) { profile in
+                    Button {
+                        _ = appState.selectLanguageProfile(id: profile.id)
+                    } label: {
+                        if profile.id == appState.languageProfileCatalog.activeProfileID {
+                            Text("✓ \(profile.name)")
+                        } else {
+                            Text("  \(profile.name)")
+                        }
+                    }
+                }
+
+                Divider()
+                Button("Manage Languages…") {
+                    appState.selectedSettingsTab = .languages
+                    NotificationCenter.default.post(name: .showSettings, object: nil)
+                }
+            }
+
             Menu("Microphone") {
                 Button {
                     appState.selectedMicrophoneID = "default"

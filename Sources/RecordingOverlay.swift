@@ -10,6 +10,7 @@ final class RecordingOverlayState: ObservableObject {
     @Published var isCommandMode = false
     @Published var updateVersion: String = ""
     @Published var errorMessage: String?
+    @Published var languageProfileMessage: String?
     @Published var toastID: UUID?
 }
 
@@ -204,6 +205,7 @@ final class RecordingOverlayManager {
         }()
         DispatchQueue.main.async {
             let toastID = UUID()
+            self.overlayState.languageProfileMessage = nil
             self.overlayState.errorMessage = truncated
             self.overlayState.toastID = toastID
             self.lockedOverlayWidth = nil
@@ -217,6 +219,41 @@ final class RecordingOverlayManager {
                     return
                 }
                 self.overlayState.errorMessage = nil
+                self.overlayState.toastID = nil
+                self.dismissAll()
+            }
+        }
+    }
+
+    /// Surface a brief, non-activating confirmation of the newly Active
+    /// Language Profile after a Switch Language shortcut cycle. Reuses
+    /// the same non-activating, `.nonactivatingPanel` menu-bar toast
+    /// mechanism as `showError` — never calls `makeKeyAndOrderFront` or
+    /// otherwise activates the app, so the frontmost application keeps
+    /// focus. Auto-dismisses quickly since this is a lightweight
+    /// confirmation rather than an error needing longer dwell time.
+    func showLanguageProfileSwitched(_ profileName: String) {
+        let truncated: String = {
+            if profileName.count <= Self.maxToastMessageLength { return profileName }
+            let cutoff = profileName.index(profileName.startIndex, offsetBy: Self.maxToastMessageLength - 1)
+            return String(profileName[..<cutoff]) + "…"
+        }()
+        DispatchQueue.main.async {
+            let toastID = UUID()
+            self.overlayState.errorMessage = nil
+            self.overlayState.languageProfileMessage = truncated
+            self.overlayState.toastID = toastID
+            self.lockedOverlayWidth = nil
+            self.overlayState.phase = .feedback
+            self.showOverlayPanel(animatedResize: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+                guard let self else { return }
+                guard self.overlayState.phase == .feedback,
+                      self.overlayState.languageProfileMessage == truncated,
+                      self.overlayState.toastID == toastID else {
+                    return
+                }
+                self.overlayState.languageProfileMessage = nil
                 self.overlayState.toastID = nil
                 self.dismissAll()
             }
@@ -350,7 +387,8 @@ final class RecordingOverlayManager {
         case .recording, .initializing, .transcribing:
             return true
         case .feedback:
-            return overlayState.errorMessage?.isEmpty ?? true
+            return (overlayState.errorMessage?.isEmpty ?? true)
+                && (overlayState.languageProfileMessage?.isEmpty ?? true)
         case .updateAvailable:
             return false
         }
@@ -383,7 +421,7 @@ final class RecordingOverlayManager {
         let width = overlayWidth
         let useCompact = (UserDefaults.standard.object(forKey: "use_compact_overlay") as? Bool) ?? true
         let forceDropDownPill = overlayState.phase == .feedback
-            && !(overlayState.errorMessage?.isEmpty ?? true)
+            && (!(overlayState.errorMessage?.isEmpty ?? true) || !(overlayState.languageProfileMessage?.isEmpty ?? true))
         // Compact mode: overlay sits flush with the menu bar on every display.
         // notchOverlap equals the menu-bar height on non-notched screens too,
         // so zero protrusion is universal — not notch-only. The legacy
@@ -404,14 +442,16 @@ final class RecordingOverlayManager {
         }
 
         if overlayState.phase == .feedback {
-            // Error toasts size to the message length so short messages do
-            // not get the same wide pill as long ones. ~6.8pt per character
-            // plus 60pt of icon and padding chrome, clamped to 180-420pt so
-            // very short messages stay readable and very long ones do not
-            // stretch the pill across the menu bar. Bare failure-X marker
-            // (no message) keeps the original 92pt.
+            // Error and Switch Language confirmation toasts size to the
+            // message length so short messages do not get the same wide
+            // pill as long ones. ~6.8pt per character plus 60pt of icon
+            // and padding chrome, clamped to 180-420pt so very short
+            // messages stay readable and very long ones do not stretch
+            // the pill across the menu bar. Bare failure-X marker (no
+            // message) keeps the original 92pt.
+            let feedbackMessage = overlayState.errorMessage ?? overlayState.languageProfileMessage
             let feedbackWidth: CGFloat = {
-                guard let msg = overlayState.errorMessage, !msg.isEmpty else {
+                guard let msg = feedbackMessage, !msg.isEmpty else {
                     return 92
                 }
                 let estimated = CGFloat(msg.count) * 6.8 + 60
@@ -445,6 +485,16 @@ final class RecordingOverlayManager {
     }
 
     private func showFeedbackPanel() {
+        // Clear any stale toast message before showing the bare failure
+        // indicator. Without this, a still-live Switch Language or error
+        // toast (its own dwell timer has not yet fired) would leak into
+        // this feedback phase and render its old text instead of the
+        // bare failure X-mark — this is the only private caller of this
+        // method, so clearing here cannot affect `showError`'s or
+        // `showLanguageProfileSwitched`'s own toast presentation, which
+        // set their message fields directly.
+        overlayState.errorMessage = nil
+        overlayState.languageProfileMessage = nil
         lockedOverlayWidth = nil
         overlayState.phase = .feedback
         showOverlayPanel(animatedResize: true)
@@ -953,6 +1003,8 @@ struct RecordingOverlayView: View {
         Group {
             if state.phase == .feedback, let message = state.errorMessage {
                 ErrorOverlayView(message: message)
+            } else if state.phase == .feedback, let profileMessage = state.languageProfileMessage {
+                LanguageProfileOverlayView(message: profileMessage)
             } else if state.phase == .feedback {
                 FailureIndicatorView()
             } else if state.phase == .updateAvailable {
@@ -1046,6 +1098,29 @@ struct ErrorOverlayView: View {
             Image(systemName: "exclamationmark.circle.fill")
                 .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(Color.red.opacity(0.92))
+            Text(message)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+}
+
+/// In-pill Switch Language confirmation. Globe icon plus the newly
+/// Active Profile's name, rendered inside the standard menu-bar pill.
+/// Mirrors `ErrorOverlayView`'s layout so the confirmation and error
+/// toasts stay visually consistent while remaining distinguishable
+/// (globe vs. exclamation icon).
+struct LanguageProfileOverlayView: View {
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "globe")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(.white)
             Text(message)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.white)
