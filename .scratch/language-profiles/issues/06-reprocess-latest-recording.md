@@ -3,8 +3,8 @@ Type: implementation
 Category: enhancement
 Blocked by: language-profiles/02-manage-language-profiles, language-profiles/04-physical-recording-shared-audio, language-profiles/05-switch-active-profile
 Worker: coding-worker-minimax-m3
-Claimed by:
-Attempts: 0
+Claimed by: 
+Attempts: 1
 
 # 06: Reprocess the latest Physical Recording
 
@@ -31,3 +31,8 @@ Attempts: 0
 - [ ] Shortcut, chooser state, processing outcomes, context reuse, shared-audio linkage, cancellation, failure, paste requests, and no-Return behavior have deterministic coverage through injected boundaries.
 - [ ] Manual verification remains documented for actual event taps, chooser interaction, Accessibility, clipboard, paste, relaunch, and audio playback.
 - [ ] Repository typechecking and focused tests pass.
+
+
+## Ralph attempt 1
+
+Blocked at 2026-09-15T16:48:07.443154+00:00: Standards review still requests changes after 3 review rounds (maxReviewRounds reached): AppState's MainActor.run adapters for reprocessing history-append/paste don't recheck Task.isCancelled after the actor hop, so Escape-cancellation could still race a paste or history write through; Spec review approved throughout, but Standards approval was not reached within the allotted rounds.
