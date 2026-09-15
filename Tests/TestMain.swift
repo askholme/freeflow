@@ -14,6 +14,7 @@ struct FreeFlowTests {
         PipelineStageToggleTests.run()
         TranscriptTextCoreTests.run()
         LanguageProfileTests.run()
+        PhysicalRecordingHistoryTests.run()
         print("FreeFlowTests passed")
     }
 }

@@ -628,6 +628,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// uses. Cleared on every exit path alongside
     /// `capturedRecordingProfile`.
     private var capturedAttemptConfiguration: LiveAttemptConfigurationBuilder.Configuration?
+    /// Stable Physical Recording identity captured at recording start.
+    /// Assigned to every `PipelineHistoryItem` produced from the same
+    /// saved WAV (including retries and a failed initial transcription),
+    /// so the run log and store can link linked Processing Attempts
+    /// without re-resolving against today's settings. Cleared on every
+    /// exit path alongside `capturedRecordingProfile`.
+    private var capturedRecordingID: UUID?
+    private var capturedRecordingCaptureTime: Date?
     private var automaticTerminationDisabled = false
     private var activeAudioInterruption: ActiveAudioInterruption?
     private var pendingOverlayDismissToken: UUID?
@@ -1596,7 +1604,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         audioFileName: item.audioFileName,
                         contextAppName: item.contextAppName,
                         contextBundleIdentifier: item.contextBundleIdentifier,
-                        contextWindowTitle: item.contextWindowTitle
+                        contextWindowTitle: item.contextWindowTitle,
+                        // Preserve Physical Recording identity across
+                        // retries; only the processing-profile snapshot
+                        // moves to the retry's resolved profile.
+                        recordingID: item.recordingID,
+                        captureTime: item.captureTime,
+                        originalProfileID: item.originalProfileID,
+                        originalProfileName: item.originalProfileName,
+                        originalInputLanguageCode: item.originalInputLanguageCode,
+                        processingProfileID: resolvedProfile.profileID,
+                        processingProfileName: resolvedProfile.profileName,
+                        processingInputLanguageCode: resolvedProfile.inputLanguageCode
                     )
                     do {
                         try pipelineHistoryStore.update(updatedItem)
@@ -1635,7 +1654,19 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         audioFileName: item.audioFileName,
                         contextAppName: item.contextAppName,
                         contextBundleIdentifier: item.contextBundleIdentifier,
-                        contextWindowTitle: item.contextWindowTitle
+                        contextWindowTitle: item.contextWindowTitle,
+                        // Preserve Physical Recording identity and
+                        // original profile across a failed retry; the
+                        // processing-profile snapshot moves to the
+                        // retry's resolved profile.
+                        recordingID: item.recordingID,
+                        captureTime: item.captureTime,
+                        originalProfileID: item.originalProfileID,
+                        originalProfileName: item.originalProfileName,
+                        originalInputLanguageCode: item.originalInputLanguageCode,
+                        processingProfileID: resolvedProfile.profileID,
+                        processingProfileName: resolvedProfile.profileName,
+                        processingInputLanguageCode: resolvedProfile.inputLanguageCode
                     )
                     do {
                         try pipelineHistoryStore.update(updatedItem)
@@ -2151,6 +2182,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         capturedContext = nil
         capturedRecordingProfile = nil
         capturedAttemptConfiguration = nil
+        capturedRecordingID = nil
+        capturedRecordingCaptureTime = nil
         currentSessionIntent = .dictation
         isRecording = false
         errorMessage = nil
@@ -2179,6 +2212,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         capturedContext = nil
         capturedRecordingProfile = nil
         capturedAttemptConfiguration = nil
+        capturedRecordingID = nil
+        capturedRecordingCaptureTime = nil
         shortcutSessionController.reset()
         activeRecordingTriggerMode = nil
         currentSessionIntent = .dictation
@@ -2566,6 +2601,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         // (below) and `stopAndTranscribe` (later) and is cleared on
         // every exit path.
         capturedRecordingProfile = resolveActiveLanguageProfile()
+        // Stamp the Physical Recording identity once at recording start.
+        // Every Processing Attempt that shares the saved WAV (initial
+        // success, failed initial transcription, retries) gets the same
+        // `recordingID` and `captureTime` so the store can link them
+        // without destructive rewriting of legacy history.
+        capturedRecordingID = UUID()
+        capturedRecordingCaptureTime = Date()
         // Build the recording-attempt configuration ONCE from the captured
         // profile snapshot and reuse it for every pipeline stage that
         // depends on the captured values. Production reads the captured
@@ -2676,6 +2718,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         capturedContext = nil
         capturedRecordingProfile = nil
         capturedAttemptConfiguration = nil
+        capturedRecordingID = nil
+        capturedRecordingCaptureTime = nil
         tearDownRealtimeService()
         cancelLocalTranscriptionWarmup()
         audioRecorder.cleanup()
@@ -3086,12 +3130,30 @@ final class AppState: ObservableObject, @unchecked Sendable {
             refreshAvailableMicrophonesIfNeeded()
             return
         }
+        // Pull the Physical Recording identity stamped at recording
+        // start before clearing so it can be attached to every linked
+        // Processing Attempt produced from this WAV (including the
+        // failure path below). The Language Profile snapshot
+        // captured at recording start becomes the original-profile
+        // identity for this Physical Recording. The processing-profile
+        // snapshot for the in-flight attempt is the same value
+        // initially; retries re-resolve from the user's current
+        // settings. Cleared alongside the other captured snapshot
+        // state so a subsequent recording starts fresh.
+        let recordingIdentity = PhysicalRecordingIdentity(
+            recordingID: capturedRecordingID ?? UUID(),
+            captureTime: capturedRecordingCaptureTime ?? Date(),
+            audioFileName: "" // filled in once saveAudioFile runs
+        )
+        let originalProfileSnapshot = capturedRecordingProfile
         // The captured snapshot and attempt configuration have been
         // handed to the transcription pipeline; clear them so a
         // subsequent recording starts a fresh attempt with its own
         // snapshot.
         capturedRecordingProfile = nil
         capturedAttemptConfiguration = nil
+        capturedRecordingID = nil
+        capturedRecordingCaptureTime = nil
         overlayManager.showTranscribing()
         audioRecorder.stopRecording { [weak self] fileURL in
             guard let self else { return }
@@ -3228,7 +3290,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             context: appContext,
                             processingStatus: processingStatus,
                             intent: sessionIntent,
-                            audioFileName: savedAudioFile?.fileName
+                            audioFileName: savedAudioFile?.fileName,
+                            recordingIdentity: recordingIdentity,
+                            originalProfile: originalProfileSnapshot,
+                            processingProfile: originalProfileSnapshot
                         )
                         self.transcriptionTask = nil
                         self.transcribingAudioFileName = nil
@@ -3328,7 +3393,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             context: resolvedContext,
                             processingStatus: "Error: \(error.localizedDescription)",
                             intent: sessionIntent,
-                            audioFileName: savedAudioFile?.fileName
+                            audioFileName: savedAudioFile?.fileName,
+                            recordingIdentity: recordingIdentity,
+                            originalProfile: originalProfileSnapshot,
+                            processingProfile: originalProfileSnapshot
                         )
                         self.audioRecorder.cleanup()
                         self.refreshAvailableMicrophonesIfNeeded()
@@ -3352,8 +3420,24 @@ final class AppState: ObservableObject, @unchecked Sendable {
         context: AppContext,
         processingStatus: String,
         intent: SessionIntent,
-        audioFileName: String? = nil
+        audioFileName: String? = nil,
+        recordingIdentity: PhysicalRecordingIdentity? = nil,
+        originalProfile: ResolvedLanguageProfile? = nil,
+        processingProfile: ResolvedLanguageProfile? = nil
     ) {
+        // Reconcile the identity's audioFileName with the audio that
+        // was actually saved. The identity carries the recording ID
+        // and capture time stamped at recording start; the WAV
+        // filename is only known once `saveAudioFile` runs.
+        let resolvedIdentity: PhysicalRecordingIdentity? = {
+            guard let recordingIdentity else { return nil }
+            let filename = audioFileName ?? recordingIdentity.audioFileName
+            return PhysicalRecordingIdentity(
+                recordingID: recordingIdentity.recordingID,
+                captureTime: recordingIdentity.captureTime,
+                audioFileName: filename
+            )
+        }()
         let newEntry = PipelineHistoryItem(
             intent: intent.persistedIntent,
             selectedText: intent.persistedSelectedText,
@@ -3375,7 +3459,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
             audioFileName: audioFileName,
             contextAppName: context.appName,
             contextBundleIdentifier: context.bundleIdentifier,
-            contextWindowTitle: context.windowTitle
+            contextWindowTitle: context.windowTitle,
+            recordingID: resolvedIdentity?.recordingID,
+            captureTime: resolvedIdentity?.captureTime,
+            originalProfileID: originalProfile?.profileID,
+            originalProfileName: originalProfile?.profileName,
+            originalInputLanguageCode: originalProfile?.inputLanguageCode,
+            processingProfileID: processingProfile?.profileID,
+            processingProfileName: processingProfile?.profileName,
+            processingInputLanguageCode: processingProfile?.inputLanguageCode
         )
         do {
             let removedAudioFileNames = try pipelineHistoryStore.append(newEntry, maxCount: maxPipelineHistoryCount)
@@ -3579,6 +3671,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             capturedContext = nil
             capturedRecordingProfile = nil
             capturedAttemptConfiguration = nil
+            capturedRecordingID = nil
+            capturedRecordingCaptureTime = nil
             isRecording = false
             restoreAudioInterruptionIfNeeded()
             shortcutSessionController.reset()

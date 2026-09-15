@@ -35,6 +35,8 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/LocalParakeetTranscriptionService.swift \
 	Sources/LocalTranscriptionPolicy.swift \
 	Sources/ModelConfiguration.swift \
+	Sources/PipelineHistoryItem.swift \
+	Sources/PipelineHistoryStore.swift \
 	Sources/RealtimeTranscriptionService.swift \
 	Sources/TranscriptTextCore.swift \
 	Sources/UpdateManager.swift \
