@@ -57,6 +57,7 @@ enum ShortcutRole {
     case toggle
     case copyAgain
     case switchLanguage
+    case reprocessLastRecording
 
     var title: String {
         switch self {
@@ -64,6 +65,7 @@ enum ShortcutRole {
         case .toggle: return "Tap to Toggle"
         case .copyAgain: return "Paste Again"
         case .switchLanguage: return "Switch Language"
+        case .reprocessLastRecording: return "Re-run Last Recording"
         }
     }
 }
@@ -75,6 +77,7 @@ enum ShortcutEvent: Equatable {
     case toggleDeactivated
     case copyAgainTriggered
     case switchLanguageTriggered
+    case reprocessLastRecordingTriggered
 }
 
 struct ShortcutConfiguration: Equatable {
@@ -82,6 +85,7 @@ struct ShortcutConfiguration: Equatable {
     let toggle: ShortcutBinding
     let copyAgain: ShortcutBinding
     let switchLanguage: ShortcutBinding
+    let reprocessLastRecording: ShortcutBinding
     let permittedAdditionalExactMatchModifiers: ShortcutModifiers
 
     init(
@@ -89,16 +93,24 @@ struct ShortcutConfiguration: Equatable {
         toggle: ShortcutBinding,
         copyAgain: ShortcutBinding = .disabled,
         switchLanguage: ShortcutBinding = .disabled,
+        reprocessLastRecording: ShortcutBinding = .disabled,
         permittedAdditionalExactMatchModifiers: ShortcutModifiers = []
     ) {
         self.hold = hold
         self.toggle = toggle
         self.copyAgain = copyAgain
         self.switchLanguage = switchLanguage
+        self.reprocessLastRecording = reprocessLastRecording
         self.permittedAdditionalExactMatchModifiers = permittedAdditionalExactMatchModifiers
     }
 
-    static let disabled = ShortcutConfiguration(hold: .disabled, toggle: .disabled, copyAgain: .disabled, switchLanguage: .disabled)
+    static let disabled = ShortcutConfiguration(
+        hold: .disabled,
+        toggle: .disabled,
+        copyAgain: .disabled,
+        switchLanguage: .disabled,
+        reprocessLastRecording: .disabled
+    )
 }
 
 enum ShortcutPreset: String, CaseIterable, Identifiable, Codable {

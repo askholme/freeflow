@@ -12,6 +12,7 @@ struct DictationShortcutEditor: View {
     @State private var toggleValidationMessage: String?
     @State private var copyAgainValidationMessage: String?
     @State private var switchLanguageValidationMessage: String?
+    @State private var reprocessLastRecordingValidationMessage: String?
 
     init(showsIntroText: Bool = true, onCaptureStateChange: ((Bool) -> Void)? = nil) {
         self.showsIntroText = showsIntroText
@@ -85,6 +86,23 @@ struct DictationShortcutEditor: View {
             )
 
             Text("Switch Language cycles the Active Profile through your configured Languages order and shows a brief confirmation. Disabled by default.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ShortcutRoleSection(
+                role: .reprocessLastRecording,
+                selection: appState.reprocessLastRecordingShortcut,
+                validationMessage: reprocessLastRecordingValidationMessage,
+                isCapturing: Binding(
+                    get: { activeCaptureRole == .reprocessLastRecording },
+                    set: { activeCaptureRole = $0 ? .reprocessLastRecording : nil }
+                ),
+                onSelect: { binding in
+                    reprocessLastRecordingValidationMessage = appState.setShortcut(binding, for: .reprocessLastRecording)
+                }
+            )
+
+            Text("Re-run Last Recording opens a non-activating chooser to reprocess the latest saved recording with a different Language Profile and pastes the new result. Unavailable while recording, transcribing, or retrying a history entry. Disabled by default.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

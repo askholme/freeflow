@@ -19,6 +19,7 @@ struct ShortcutInputState: Equatable {
     var toggleIsActive = false
     var copyAgainIsActive = false
     var switchLanguageIsActive = false
+    var reprocessLastRecordingIsActive = false
 
     var currentModifiers: ShortcutModifiers {
         ShortcutBinding.modifiers(for: pressedModifierKeyCodes)
@@ -31,7 +32,8 @@ struct ShortcutInputState: Equatable {
             let isToggleKey = configuration.toggle.kind == .key && configuration.toggle.keyCode == keyCode
             let isCopyAgainKey = configuration.copyAgain.kind == .key && configuration.copyAgain.keyCode == keyCode
             let isSwitchLanguageKey = configuration.switchLanguage.kind == .key && configuration.switchLanguage.keyCode == keyCode
-            return isHoldKey || isToggleKey || isCopyAgainKey || isSwitchLanguageKey
+            let isReprocessLastRecordingKey = configuration.reprocessLastRecording.kind == .key && configuration.reprocessLastRecording.keyCode == keyCode
+            return isHoldKey || isToggleKey || isCopyAgainKey || isSwitchLanguageKey || isReprocessLastRecordingKey
         }
         if keyReferenceHeld {
             return true
@@ -62,6 +64,14 @@ struct ShortcutInputState: Equatable {
         }
 
         if configuration.switchLanguage.referencesPressedModifiers(
+            pressedModifierKeyCodes: pressedModifierKeyCodes,
+            currentModifiers: currentModifiers,
+            permittedAdditionalExactMatchModifiers: configuration.permittedAdditionalExactMatchModifiers
+        ) {
+            return true
+        }
+
+        if configuration.reprocessLastRecording.referencesPressedModifiers(
             pressedModifierKeyCodes: pressedModifierKeyCodes,
             currentModifiers: currentModifiers,
             permittedAdditionalExactMatchModifiers: configuration.permittedAdditionalExactMatchModifiers
@@ -185,21 +195,25 @@ enum ShortcutMatcher {
         let previousToggle = state.toggleIsActive
         let previousCopyAgain = state.copyAgainIsActive
         let previousSwitchLanguage = state.switchLanguageIsActive
+        let previousReprocessLastRecording = state.reprocessLastRecordingIsActive
 
         state.holdIsActive = bindingIsActive(configuration.hold, state: state, configuration: configuration)
         state.toggleIsActive = bindingIsActive(configuration.toggle, state: state, configuration: configuration)
         state.copyAgainIsActive = bindingIsActive(configuration.copyAgain, state: state, configuration: configuration)
         state.switchLanguageIsActive = bindingIsActive(configuration.switchLanguage, state: state, configuration: configuration)
+        state.reprocessLastRecordingIsActive = bindingIsActive(configuration.reprocessLastRecording, state: state, configuration: configuration)
 
         return emitChanges(
             previousHold: previousHold,
             previousToggle: previousToggle,
             previousCopyAgain: previousCopyAgain,
             previousSwitchLanguage: previousSwitchLanguage,
+            previousReprocessLastRecording: previousReprocessLastRecording,
             currentHold: state.holdIsActive,
             currentToggle: state.toggleIsActive,
             currentCopyAgain: state.copyAgainIsActive,
             currentSwitchLanguage: state.switchLanguageIsActive,
+            currentReprocessLastRecording: state.reprocessLastRecordingIsActive,
             configuration: configuration
         )
     }
@@ -209,10 +223,12 @@ enum ShortcutMatcher {
         previousToggle: Bool,
         previousCopyAgain: Bool,
         previousSwitchLanguage: Bool,
+        previousReprocessLastRecording: Bool,
         currentHold: Bool,
         currentToggle: Bool,
         currentCopyAgain: Bool,
         currentSwitchLanguage: Bool,
+        currentReprocessLastRecording: Bool,
         configuration: ShortcutConfiguration
     ) -> [ShortcutEvent] {
         var activations: [(ShortcutEvent, Int)] = []
@@ -231,6 +247,10 @@ enum ShortcutMatcher {
         // Switch Language is also a one-shot: fire on the leading edge only.
         if !previousSwitchLanguage && currentSwitchLanguage {
             activations.append((.switchLanguageTriggered, configuration.switchLanguage.specificityScore))
+        }
+        // Re-run Last Recording is also a one-shot: fire on the leading edge only.
+        if !previousReprocessLastRecording && currentReprocessLastRecording {
+            activations.append((.reprocessLastRecordingTriggered, configuration.reprocessLastRecording.specificityScore))
         }
         if previousHold && !currentHold {
             deactivations.append((.holdDeactivated, configuration.hold.specificityScore))
@@ -293,7 +313,7 @@ enum ShortcutMatcher {
         for keyCode: UInt16,
         configuration: ShortcutConfiguration
     ) -> [ShortcutBinding] {
-        [configuration.hold, configuration.toggle, configuration.copyAgain, configuration.switchLanguage].filter { binding in
+        [configuration.hold, configuration.toggle, configuration.copyAgain, configuration.switchLanguage, configuration.reprocessLastRecording].filter { binding in
             binding.kind == .key && binding.keyCode == keyCode
         }
     }
@@ -302,7 +322,7 @@ enum ShortcutMatcher {
         for keyCode: UInt16,
         configuration: ShortcutConfiguration
     ) -> [ShortcutBinding] {
-        [configuration.hold, configuration.toggle, configuration.copyAgain, configuration.switchLanguage].filter { binding in
+        [configuration.hold, configuration.toggle, configuration.copyAgain, configuration.switchLanguage, configuration.reprocessLastRecording].filter { binding in
             switch binding.kind {
             case .key, .modifierKey:
                 return modifierEvent(for: keyCode, affects: binding)

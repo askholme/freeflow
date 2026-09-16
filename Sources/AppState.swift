@@ -213,10 +213,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let toggleShortcutStorageKey = "toggle_shortcut"
     private let copyAgainShortcutStorageKey = "copy_again_shortcut"
     private let switchLanguageShortcutStorageKey = "switch_language_shortcut"
+    private let reprocessLastRecordingShortcutStorageKey = "reprocess_last_recording_shortcut"
     private let savedHoldCustomShortcutStorageKey = "saved_hold_custom_shortcut"
     private let savedToggleCustomShortcutStorageKey = "saved_toggle_custom_shortcut"
     private let savedCopyAgainCustomShortcutStorageKey = "saved_copy_again_custom_shortcut"
     private let savedSwitchLanguageCustomShortcutStorageKey = "saved_switch_language_custom_shortcut"
+    private let savedReprocessLastRecordingCustomShortcutStorageKey = "saved_reprocess_last_recording_custom_shortcut"
     private let customVocabularyStorageKey = "custom_vocabulary"
     private let transcriptionLanguageStorageKey = "transcription_language"
     private let selectedMicrophoneStorageKey = "selected_microphone_id"
@@ -353,6 +355,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    @Published var reprocessLastRecordingShortcut: ShortcutBinding {
+        didSet {
+            persistShortcut(reprocessLastRecordingShortcut, key: reprocessLastRecordingShortcutStorageKey)
+            restartHotkeyMonitoring()
+        }
+    }
+
     @Published private(set) var savedHoldCustomShortcut: ShortcutBinding? {
         didSet {
             persistOptionalShortcut(savedHoldCustomShortcut, key: savedHoldCustomShortcutStorageKey)
@@ -374,6 +383,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published private(set) var savedSwitchLanguageCustomShortcut: ShortcutBinding? {
         didSet {
             persistOptionalShortcut(savedSwitchLanguageCustomShortcut, key: savedSwitchLanguageCustomShortcutStorageKey)
+        }
+    }
+
+    @Published private(set) var savedReprocessLastRecordingCustomShortcut: ShortcutBinding? {
+        didSet {
+            persistOptionalShortcut(savedReprocessLastRecordingCustomShortcut, key: savedReprocessLastRecordingCustomShortcutStorageKey)
         }
     }
 
@@ -566,6 +581,23 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
     @Published var isTranscribing = false
     @Published var retryingItemIDs: Set<UUID> = []
+    /// Non-nil while the Re-run Last Recording chooser panel is open.
+    /// While non-nil, `handleShortcutEvent` suppresses every
+    /// configured global shortcut except Escape (handled separately
+    /// through `handleEscapeKeyPress`), and a new Re-run Last
+    /// Recording trigger is rejected.
+    @Published private(set) var reprocessChooserState: ReprocessProfileChooserState?
+    /// Phase of the in-flight reprocessing `Task`, from the moment
+    /// `startReprocessing(withProfile:)` creates `reprocessTask`
+    /// through the coordinator's success/failure AND, on success with
+    /// a non-empty result, the deferred paste window that follows.
+    /// Distinct from `reprocessChooserState` (open only while the
+    /// profile picker is on screen); combined via
+    /// `isReprocessingLastRecordingActive` so callers have one
+    /// predicate covering the whole reprocessing lifecycle — chooser
+    /// open through in-flight transcription/processing through the
+    /// pending paste. See `ReprocessLastRecordingPhase`.
+    @Published private(set) var reprocessLastRecordingPhase: ReprocessLastRecordingPhase = .idle
     @Published var lastTranscript: String = ""
     @Published var errorMessage: String?
     @Published var statusText: String = "Ready"
@@ -651,6 +683,36 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// exit path alongside `capturedRecordingProfile`.
     private var capturedRecordingID: UUID?
     private var capturedRecordingCaptureTime: Date?
+    /// Physical Recording resolved when the Re-run Last Recording
+    /// chooser opened. Consumed (and cleared) once the user confirms
+    /// a profile so `startReprocessing(withProfile:)` knows which
+    /// saved WAV and history row to reprocess and link against.
+    /// Cleared on cancel too.
+    private var pendingReprocessRecording: ReprocessLastRecording.EligibleRecording?
+    /// In-flight reprocessing `Task`, held so Escape can cancel it.
+    /// `ReprocessLastRecordingCoordinator.run(audioURL:)` observes
+    /// cancellation at every checkpoint, including immediately inside
+    /// the MainActor hop that performs the history append / paste, so
+    /// cancelling this task can never race a mutating side effect.
+    private var reprocessTask: Task<Void, Never>?
+    /// Set right before scheduling a successful reprocessing result's
+    /// deferred, shortcut-released paste; cleared once that paste
+    /// fires or is cancelled. Escape checks this (in addition to
+    /// `reprocessChooserState`/`reprocessTask`) so a pending paste
+    /// that is already queued — after the coordinator `Task` itself
+    /// has finished and been cleared — can still be cancelled before
+    /// it executes.
+    private var pendingReprocessPasteToken: UUID?
+    /// The clipboard-restore snapshot captured by
+    /// `writeTranscriptToPasteboard` when a reprocessing paste is
+    /// scheduled, kept alongside `pendingReprocessPasteToken` so
+    /// `cancelPendingReprocessPaste()` can restore the user's real
+    /// prior clipboard contents via the existing
+    /// `restoreClipboardIfNeeded` mechanism if Escape cancels the
+    /// paste before it fires. Without this, the clipboard would be
+    /// left permanently overwritten with the reprocessed transcript.
+    private var pendingReprocessClipboardRestore: PendingClipboardRestore?
+    private let reprocessChooserManager = ReprocessProfileChooserManager()
     private var automaticTerminationDisabled = false
     private var activeAudioInterruption: ActiveAudioInterruption?
     private var pendingOverlayDismissToken: UUID?
@@ -684,7 +746,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             holdKey: holdShortcutStorageKey,
             toggleKey: toggleShortcutStorageKey,
             copyAgainKey: copyAgainShortcutStorageKey,
-            switchLanguageKey: switchLanguageShortcutStorageKey
+            switchLanguageKey: switchLanguageShortcutStorageKey,
+            reprocessLastRecordingKey: reprocessLastRecordingShortcutStorageKey
         )
         let savedHoldCustomShortcut = Self.loadSavedCustomShortcut(
             forKey: savedHoldCustomShortcutStorageKey,
@@ -701,6 +764,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let savedSwitchLanguageCustomShortcut = Self.loadSavedCustomShortcut(
             forKey: savedSwitchLanguageCustomShortcutStorageKey,
             fallback: shortcuts.switchLanguage.isCustom ? shortcuts.switchLanguage : nil
+        )
+        let savedReprocessLastRecordingCustomShortcut = Self.loadSavedCustomShortcut(
+            forKey: savedReprocessLastRecordingCustomShortcutStorageKey,
+            fallback: shortcuts.reprocessLastRecording.isCustom ? shortcuts.reprocessLastRecording : nil
         )
         let customVocabulary = UserDefaults.standard.string(forKey: customVocabularyStorageKey) ?? ""
         let transcriptionLanguage = Self.normalizeTranscriptionLanguage(
@@ -809,10 +876,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.toggleShortcut = shortcuts.toggle
         self.copyAgainShortcut = shortcuts.copyAgain
         self.switchLanguageShortcut = shortcuts.switchLanguage
+        self.reprocessLastRecordingShortcut = shortcuts.reprocessLastRecording
         self.savedHoldCustomShortcut = savedHoldCustomShortcut.binding
         self.savedToggleCustomShortcut = savedToggleCustomShortcut.binding
         self.savedCopyAgainCustomShortcut = savedCopyAgainCustomShortcut.binding
         self.savedSwitchLanguageCustomShortcut = savedSwitchLanguageCustomShortcut.binding
+        self.savedReprocessLastRecordingCustomShortcut = savedReprocessLastRecordingCustomShortcut.binding
         self.isCommandModeEnabled = isCommandModeEnabled
         self.commandModeStyle = commandModeStyle
         self.commandModeManualModifier = commandModeManualModifier
@@ -858,6 +927,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         if shortcuts.didUpdateSwitchLanguageStoredValue {
             persistShortcut(shortcuts.switchLanguage, key: switchLanguageShortcutStorageKey)
         }
+        if shortcuts.didUpdateReprocessLastRecordingStoredValue {
+            persistShortcut(shortcuts.reprocessLastRecording, key: reprocessLastRecordingShortcutStorageKey)
+        }
         if savedHoldCustomShortcut.didUpdateStoredValue {
             persistOptionalShortcut(savedHoldCustomShortcut.binding, key: savedHoldCustomShortcutStorageKey)
         }
@@ -869,6 +941,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
         if savedSwitchLanguageCustomShortcut.didUpdateStoredValue {
             persistOptionalShortcut(savedSwitchLanguageCustomShortcut.binding, key: savedSwitchLanguageCustomShortcutStorageKey)
+        }
+        if savedReprocessLastRecordingCustomShortcut.didUpdateStoredValue {
+            persistOptionalShortcut(savedReprocessLastRecordingCustomShortcut.binding, key: savedReprocessLastRecordingCustomShortcutStorageKey)
         }
 
         if loadedLanguageProfileCatalog.didRepairStoredValue {
@@ -884,6 +959,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
             DispatchQueue.main.async {
                 self?.handleUpdateOverlayPressed()
             }
+        }
+        reprocessChooserManager.onArrowUp = { [weak self] in
+            self?.handleReprocessChooserKey(.up)
+        }
+        reprocessChooserManager.onArrowDown = { [weak self] in
+            self?.handleReprocessChooserKey(.down)
+        }
+        reprocessChooserManager.onConfirm = { [weak self] in
+            self?.handleReprocessChooserKey(.confirm)
+        }
+        reprocessChooserManager.onCancel = { [weak self] in
+            self?.handleReprocessChooserKey(.cancel)
         }
 
         // Clear any stale recording flag left over from an unclean exit.
@@ -926,10 +1013,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let toggle: ShortcutBinding
         let copyAgain: ShortcutBinding
         let switchLanguage: ShortcutBinding
+        let reprocessLastRecording: ShortcutBinding
         let didUpdateHoldStoredValue: Bool
         let didUpdateToggleStoredValue: Bool
         let didUpdateCopyAgainStoredValue: Bool
         let didUpdateSwitchLanguageStoredValue: Bool
+        let didUpdateReprocessLastRecordingStoredValue: Bool
     }
 
     private struct StoredOptionalShortcut {
@@ -982,7 +1071,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         holdKey: String,
         toggleKey: String,
         copyAgainKey: String,
-        switchLanguageKey: String
+        switchLanguageKey: String,
+        reprocessLastRecordingKey: String
     ) -> StoredShortcutConfiguration {
         let legacyPreset = ShortcutPreset(
             rawValue: UserDefaults.standard.string(forKey: "hotkey_option") ?? ShortcutPreset.fnKey.rawValue
@@ -993,15 +1083,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let storedToggle = loadShortcut(forKey: toggleKey)
         let storedCopyAgain = loadShortcut(forKey: copyAgainKey)
         let storedSwitchLanguage = loadShortcut(forKey: switchLanguageKey)
+        let storedReprocessLastRecording = loadShortcut(forKey: reprocessLastRecordingKey)
         return StoredShortcutConfiguration(
             hold: storedHold.binding ?? hold,
             toggle: storedToggle.binding ?? toggle,
             copyAgain: storedCopyAgain.binding ?? .disabled,
             switchLanguage: storedSwitchLanguage.binding ?? .disabled,
+            reprocessLastRecording: storedReprocessLastRecording.binding ?? .disabled,
             didUpdateHoldStoredValue: storedHold.binding == nil || storedHold.didNormalize,
             didUpdateToggleStoredValue: storedToggle.binding == nil || storedToggle.didNormalize,
             didUpdateCopyAgainStoredValue: storedCopyAgain.didNormalize,
-            didUpdateSwitchLanguageStoredValue: storedSwitchLanguage.didNormalize
+            didUpdateSwitchLanguageStoredValue: storedSwitchLanguage.didNormalize,
+            didUpdateReprocessLastRecordingStoredValue: storedReprocessLastRecording.didNormalize
         )
     }
 
@@ -1534,6 +1627,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     func retryTranscription(item: PipelineHistoryItem) {
+        // History Retry and Re-run Last Recording reprocessing are
+        // mutually exclusive: reprocessing already rejects while a
+        // Retry is active (via `retryingItemIDs`, see
+        // `ReprocessLastRecording.shouldRejectTrigger`'s
+        // `isHistoryRetryActive` parameter), and this rejects the
+        // reverse direction — no lookup, no state change — while the
+        // Re-run Last Recording chooser is open or a reprocessing
+        // attempt is in flight.
+        guard !ReprocessLastRecording.shouldRejectHistoryRetryTrigger(
+            isReprocessingActive: isReprocessingLastRecordingActive
+        ) else { return }
         guard let audioFileName = item.audioFileName else { return }
         guard !retryingItemIDs.contains(item.id) else { return }
 
@@ -1885,7 +1989,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     var usesFnShortcut: Bool {
-        holdShortcut.usesFnKey || toggleShortcut.usesFnKey || copyAgainShortcut.usesFnKey || switchLanguageShortcut.usesFnKey
+        holdShortcut.usesFnKey || toggleShortcut.usesFnKey || copyAgainShortcut.usesFnKey || switchLanguageShortcut.usesFnKey || reprocessLastRecordingShortcut.usesFnKey
     }
 
     var hasEnabledHoldShortcut: Bool {
@@ -1927,6 +2031,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             return savedCopyAgainCustomShortcut
         case .switchLanguage:
             return savedSwitchLanguageCustomShortcut
+        case .reprocessLastRecording:
+            return savedReprocessLastRecordingCustomShortcut
         }
     }
 
@@ -1980,6 +2086,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         if role != .switchLanguage, binding.conflicts(with: switchLanguageShortcut) {
             return "This shortcut is already used by Switch Language."
         }
+        if role != .reprocessLastRecording, binding.conflicts(with: reprocessLastRecordingShortcut) {
+            return "This shortcut is already used by Re-run Last Recording."
+        }
         if role == .copyAgain {
             if binding.conflicts(with: holdShortcut) {
                 return "Paste Again cannot share a shortcut with Hold to Talk."
@@ -2004,6 +2113,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return "Switch Language cannot share the Edit Mode modifier."
             }
         }
+        if role == .reprocessLastRecording {
+            if binding.conflicts(with: holdShortcut) {
+                return "Re-run Last Recording cannot share a shortcut with Hold to Talk."
+            }
+            if binding.conflicts(with: toggleShortcut) {
+                return "Re-run Last Recording cannot share a shortcut with Tap to Toggle."
+            }
+            if isCommandModeEnabled, commandModeStyle == .manual,
+               bindingCollides(binding, with: commandModeManualModifier) {
+                return "Re-run Last Recording cannot share the Edit Mode modifier."
+            }
+        }
 
         switch role {
         case .hold:
@@ -2026,6 +2147,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 savedSwitchLanguageCustomShortcut = binding
             }
             switchLanguageShortcut = binding
+        case .reprocessLastRecording:
+            if binding.isCustom {
+                savedReprocessLastRecordingCustomShortcut = binding
+            }
+            reprocessLastRecordingShortcut = binding
         }
 
         return nil
@@ -2036,12 +2162,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
         holdBinding: ShortcutBinding? = nil,
         toggleBinding: ShortcutBinding? = nil,
         copyAgainBinding: ShortcutBinding? = nil,
-        switchLanguageBinding: ShortcutBinding? = nil
+        switchLanguageBinding: ShortcutBinding? = nil,
+        reprocessLastRecordingBinding: ShortcutBinding? = nil
     ) -> String? {
         let holdBinding = holdBinding ?? holdShortcut
         let toggleBinding = toggleBinding ?? toggleShortcut
         let copyAgainBinding = copyAgainBinding ?? copyAgainShortcut
         let switchLanguageBinding = switchLanguageBinding ?? switchLanguageShortcut
+        let reprocessLastRecordingBinding = reprocessLastRecordingBinding ?? reprocessLastRecordingShortcut
         let manualModifier = modifier.shortcutModifier
 
         if !holdBinding.isDisabled && holdBinding.modifiers.contains(manualModifier) {
@@ -2055,6 +2183,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
         if !switchLanguageBinding.isDisabled && switchLanguageBinding.modifiers.contains(manualModifier) {
             return "That modifier is already part of the Switch Language shortcut."
+        }
+        if !reprocessLastRecordingBinding.isDisabled && reprocessLastRecordingBinding.modifiers.contains(manualModifier) {
+            return "That modifier is already part of the Re-run Last Recording shortcut."
         }
         // Modifier-only bindings carry identity in keyCode, not modifiers.
         if !holdBinding.isDisabled,
@@ -2080,6 +2211,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
            let bindingModifier = ShortcutBinding.modifier(forKeyCode: switchLanguageBinding.keyCode),
            bindingModifier == manualModifier {
             return "That modifier is already the Switch Language shortcut."
+        }
+        if !reprocessLastRecordingBinding.isDisabled,
+           reprocessLastRecordingBinding.kind == .modifierKey,
+           let bindingModifier = ShortcutBinding.modifier(forKeyCode: reprocessLastRecordingBinding.keyCode),
+           bindingModifier == manualModifier {
+            return "That modifier is already the Re-run Last Recording shortcut."
         }
 
         return nil
@@ -2141,6 +2278,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             toggle: toggleShortcut,
             copyAgain: copyAgainShortcut,
             switchLanguage: switchLanguageShortcut,
+            reprocessLastRecording: reprocessLastRecordingShortcut,
             permittedAdditionalExactMatchModifiers: permittedAdditionalExactMatchModifiers
         )
     }
@@ -2161,12 +2299,24 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private func handleShortcutEvent(_ event: ShortcutEvent) {
+        // While the Re-run Last Recording chooser is open, every
+        // configured global shortcut is suppressed — including a
+        // second Re-run Last Recording trigger. Chooser navigation
+        // (arrows/Return) is handled directly by the chooser panel's
+        // own key events, and Escape is handled separately through
+        // `handleEscapeKeyPress`, so neither is routed through here.
+        guard reprocessChooserState == nil else { return }
+
         if event == .copyAgainTriggered {
             copyLastTranscriptToPasteboard()
             return
         }
         if event == .switchLanguageTriggered {
             handleSwitchLanguageShortcutTriggered()
+            return
+        }
+        if event == .reprocessLastRecordingTriggered {
+            handleReprocessLastRecordingShortcutTriggered()
             return
         }
 
@@ -2197,6 +2347,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private func handleEscapeKeyPress() -> Bool {
+        if reprocessChooserState != nil {
+            cancelReprocessChooser()
+            return true
+        }
+
+        if reprocessTask != nil {
+            cancelReprocessLastRecording()
+            return true
+        }
+
+        if pendingReprocessPasteToken != nil {
+            cancelPendingReprocessPaste()
+            return true
+        }
+
         if isTranscribing {
             cancelTranscription()
             return true
@@ -2244,6 +2409,420 @@ final class AppState: ObservableObject, @unchecked Sendable {
         languageProfileCatalog = result.catalog
         persistLanguageProfiles(result.catalog)
         overlayManager.showLanguageProfileSwitched(result.profile.name)
+    }
+
+    // MARK: - Reprocess Last Recording
+
+    /// True while the Re-run Last Recording chooser is open OR
+    /// `reprocessLastRecordingPhase` is non-idle — which covers the
+    /// coordinator `Task` itself AND, on success with a non-empty
+    /// result, the deferred paste window that runs after the task has
+    /// already finished. Exposed (not `private`) so `retryTranscription`
+    /// and the Run Log's Retry button can enforce the required mutual
+    /// exclusion: a history Retry cannot start while reprocessing is
+    /// active — including while a reprocessing paste is still queued —
+    /// and reprocessing cannot start while a history Retry is active
+    /// (checked separately via `retryingItemIDs`).
+    var isReprocessingLastRecordingActive: Bool {
+        reprocessChooserState != nil || reprocessLastRecordingPhase.isBusy
+    }
+
+    /// Handle the matched Re-run Last Recording shortcut event.
+    /// Ignored entirely — no lookup, no chooser, no feedback overlay —
+    /// while recording, transcribing, a history Retry, or another
+    /// reprocessing attempt is already in flight, per
+    /// `ReprocessLastRecording.shouldRejectTrigger`. Otherwise resolves
+    /// the latest Physical Recording, computes the eligible profiles
+    /// (excluding the original profile's UUID while it still exists),
+    /// and opens the non-activating chooser. A missing WAV, an absent
+    /// recording, or no eligible profile surfaces concise, non-
+    /// destructive feedback through the existing error-toast overlay
+    /// without mutating any state.
+    private func handleReprocessLastRecordingShortcutTriggered() {
+        guard !ReprocessLastRecording.shouldRejectTrigger(
+            isRecording: isRecording,
+            isTranscribing: isTranscribing,
+            isHistoryRetryActive: !retryingItemIDs.isEmpty,
+            isReprocessingActive: isReprocessingLastRecordingActive
+        ) else { return }
+
+        let resolution = ReprocessLastRecording.resolveLatestEligibleRecording(
+            history: pipelineHistory,
+            audioStorageDirectory: Self.audioStorageDirectory()
+        )
+        switch resolution {
+        case .failure(let failure):
+            overlayManager.showError(failure.message)
+        case .success(let eligible):
+            let eligibleProfileList = ReprocessLastRecording.eligibleProfiles(
+                catalog: languageProfileCatalog,
+                excludingOriginalProfileID: eligible.item.effectiveOriginalProfileID
+            )
+            guard let chooserState = ReprocessProfileChooser.open(
+                recordingItemID: eligible.item.id,
+                eligibleProfiles: eligibleProfileList
+            ) else {
+                overlayManager.showError(ReprocessLastRecording.Failure.noEligibleProfile.message)
+                return
+            }
+            pendingReprocessRecording = eligible
+            reprocessChooserState = chooserState
+            reprocessChooserManager.show(
+                profiles: chooserState.profiles,
+                selectedIndex: chooserState.selectedIndex
+            )
+        }
+    }
+
+    /// Route one chooser key event through the pure
+    /// `ReprocessProfileChooser` reducer and apply the resulting
+    /// navigation, confirmation, or cancellation.
+    private func handleReprocessChooserKey(_ key: ReprocessChooserKey) {
+        guard let state = reprocessChooserState else { return }
+        switch ReprocessProfileChooser.handle(key, state: state) {
+        case .navigated(let next):
+            reprocessChooserState = next
+            reprocessChooserManager.updateSelection(next.selectedIndex)
+        case .confirmed(let profile):
+            reprocessChooserManager.dismiss()
+            reprocessChooserState = nil
+            startReprocessing(withProfile: profile)
+        case .cancelled:
+            cancelReprocessChooser()
+        }
+    }
+
+    /// Dismiss the chooser without starting a Processing Attempt or
+    /// changing the Active Profile.
+    private func cancelReprocessChooser() {
+        reprocessChooserManager.dismiss()
+        reprocessChooserState = nil
+        pendingReprocessRecording = nil
+    }
+
+    /// Cancel an in-flight reprocessing attempt. The coordinator
+    /// observes cancellation at every checkpoint — including
+    /// immediately inside the MainActor hop that would otherwise
+    /// append a history row or trigger paste — so cancelling here can
+    /// never race a mutating side effect through, and no history
+    /// result is created.
+    private func cancelReprocessLastRecording() {
+        reprocessTask?.cancel()
+        reprocessTask = nil
+        // No paste can be queued yet while the coordinator `Task` is
+        // still in flight, and the clipboard has not been touched
+        // yet either, but clear both defensively so stray state can
+        // never survive into a later attempt.
+        pendingReprocessPasteToken = nil
+        pendingReprocessClipboardRestore = nil
+        reprocessLastRecordingPhase = .idle
+        pendingReprocessRecording = nil
+        overlayManager.dismiss()
+    }
+
+    /// Cancel a reprocessing result's deferred, shortcut-released
+    /// paste while it is still queued — i.e. after the coordinator
+    /// `Task` already finished successfully (history was appended and
+    /// the clipboard was already overwritten with the reprocessed
+    /// transcript) but before `performAfterShortcutReleased` has
+    /// actually invoked `pasteAtCursor()`. Invalidates
+    /// `pendingReprocessPasteToken` so the queued action's token check
+    /// (see `startReprocessing`) no-ops instead of pasting, restores
+    /// the user's real prior clipboard contents through the same
+    /// `restoreClipboardIfNeeded` mechanism a completed paste would
+    /// have used, and immediately clears the busy phase so a Retry is
+    /// no longer rejected.
+    private func cancelPendingReprocessPaste() {
+        pendingReprocessPasteToken = nil
+        let clipboardRestore = pendingReprocessClipboardRestore
+        pendingReprocessClipboardRestore = nil
+        reprocessLastRecordingPhase = .idle
+        overlayManager.dismiss()
+        restoreClipboardIfNeeded(clipboardRestore)
+    }
+
+    /// Start reprocessing the pending eligible recording with the
+    /// user-chosen profile. Resolves a current, immutable snapshot of
+    /// the chosen profile (never the Active Profile, which is left
+    /// untouched), reuses the original row's stored context, selected
+    /// text, and dictation-or-Edit-Mode intent without capturing
+    /// current context, and runs the saved-file-or-local transcription
+    /// path — never realtime streaming — through
+    /// `ReprocessLastRecordingCoordinator`.
+    private func startReprocessing(withProfile profile: LanguageProfile) {
+        guard let eligible = pendingReprocessRecording else { return }
+        pendingReprocessRecording = nil
+
+        let originalItem = eligible.item
+        let credentialOverride = languageProfileCredentialStore.loadAPIKeyOverride(profileID: profile.id) ?? ""
+        let resolvedProfile = LanguageProfiles.resolve(
+            profile: profile,
+            globalDefaults: currentLanguageProfileGlobalDefaults(),
+            credentialOverride: credentialOverride
+        )
+        let ordinaryCleanupSystemPrompt = LanguageProfiles.customSystemPrompt(
+            for: .ordinaryDictation,
+            resolvedProfile: resolvedProfile
+        )
+
+        // Reuse the original row's stored context, selected text, and
+        // original dictation-or-Edit-Mode intent verbatim — never a
+        // freshly captured context.
+        let restoredContext = AppContext(
+            appName: nil,
+            bundleIdentifier: nil,
+            windowTitle: nil,
+            selectedText: nil,
+            currentActivity: originalItem.contextSummary,
+            contextSystemPrompt: originalItem.contextSystemPrompt,
+            contextPrompt: originalItem.contextPrompt,
+            screenshotDataURL: originalItem.contextScreenshotDataURL,
+            screenshotMimeType: originalItem.contextScreenshotDataURL != nil ? "image/jpeg" : nil,
+            screenshotError: nil
+        )
+        let restoredIntent = SessionIntent.fromPersisted(
+            intent: originalItem.intent,
+            selectedText: originalItem.selectedText
+        )
+
+        let postProcessingService = PostProcessingService(
+            apiKey: apiKey,
+            baseURL: apiBaseURL,
+            preferredModel: postProcessingModel,
+            preferredFallbackModel: postProcessingFallbackModel,
+            instructionExecutionGuardEnabled: instructionExecutionGuardEnabled
+        )
+        let capturedCustomVocabulary = customVocabulary
+        let capturedOutputLanguage = outputLanguage
+        let capturedPreserveExactWording = preserveExactWording
+        let capturedPressEnterEnabled = isPressEnterVoiceCommandEnabled
+        // The system prompt actually used for this reprocessing
+        // attempt's ordinary-dictation cleanup: the chosen profile's
+        // resolved cleanup prompt, falling back to the built-in
+        // default exactly like `stopAndTranscribe` does for a live
+        // recording. Recorded on the new linked history row below —
+        // never the original row's stored `systemPrompt`, which
+        // reflects a different (possibly different-profile) attempt.
+        let effectiveReprocessingSystemPrompt = Self.resolvedSystemPrompt(ordinaryCleanupSystemPrompt)
+
+        let dependencies = ReprocessLastRecordingCoordinator.Dependencies(
+            transcribe: { [weak self] url in
+                guard let self else { throw CancellationError() }
+                let service = try self.makeTranscriptionService(resolvedProfile: resolvedProfile)
+                return try await service.transcribe(fileURL: url)
+            },
+            parseTranscriptCommands: { raw in
+                let parsed = Self.parseTranscriptCommands(
+                    from: raw,
+                    pressEnterCommandEnabled: capturedPressEnterEnabled
+                )
+                return (parsed.transcript, parsed.shouldPressEnterAfterPaste)
+            },
+            process: { [weak self] transcript in
+                guard let self else { return (transcript, "", "") }
+                let result = await self.processTranscript(
+                    transcript,
+                    intent: restoredIntent,
+                    context: restoredContext,
+                    postProcessingService: postProcessingService,
+                    customVocabulary: capturedCustomVocabulary,
+                    ordinaryCleanupSystemPrompt: ordinaryCleanupSystemPrompt,
+                    outputLanguage: capturedOutputLanguage,
+                    preserveExactWording: capturedPreserveExactWording
+                )
+                let statusMessage = result.outcome.statusMessage(isRetry: false)
+                return (result.finalTranscript, statusMessage, result.prompt)
+            },
+            applySuccess: { [weak self] payload in
+                guard let self else { return }
+                self.reprocessTask = nil
+                let trimmedFinal = payload.finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+                let historySaved = self.recordReprocessedHistoryEntry(
+                    rawTranscript: payload.rawTranscript,
+                    postProcessedTranscript: trimmedFinal,
+                    postProcessingPrompt: payload.postProcessingPrompt,
+                    processingStatus: payload.processingStatus,
+                    systemPrompt: effectiveReprocessingSystemPrompt,
+                    customVocabulary: capturedCustomVocabulary,
+                    originalItem: originalItem,
+                    processingProfile: resolvedProfile
+                )
+                self.overlayManager.dismiss()
+                switch ReprocessSuccessOutcome.decide(historySaved: historySaved, trimmedFinalTranscript: trimmedFinal) {
+                case .historySaveFailed:
+                    // The linked history result was never actually
+                    // retained — never paste it. `errorMessage` was
+                    // already set by `recordReprocessedHistoryEntry`;
+                    // also surface the concise overlay feedback used
+                    // by every other reprocessing failure path. The
+                    // clipboard is never touched on this path.
+                    self.reprocessLastRecordingPhase = .idle
+                    self.overlayManager.showError("Reprocessing failed: could not save the result.")
+                case .nothingToPaste:
+                    // Nothing to paste — the reprocessing lifecycle
+                    // ends here; a Retry may proceed immediately.
+                    self.reprocessLastRecordingPhase = .idle
+                case .shouldPaste:
+                    // Reprocessing never synthesizes Return from the
+                    // trailing voice command, regardless of what
+                    // `parseTranscriptCommands` detected — only the
+                    // paste itself runs, using current focus and
+                    // clipboard behavior exactly like ordinary
+                    // dictation.
+                    //
+                    // The busy phase MUST stay non-idle until this
+                    // deferred paste actually executes (or is
+                    // cancelled): `pasteAtCursorWhenShortcutReleased`
+                    // can wait for the shortcut that triggered
+                    // reprocessing to be released before it fires, and
+                    // a concurrent history Retry must not be able to
+                    // overwrite the pasteboard during that window.
+                    // Called directly through the shared
+                    // `performAfterShortcutReleased` (rather than the
+                    // `pasteAtCursorWhenShortcutReleased` convenience
+                    // wrapper) so this closure can guard the actual
+                    // paste itself with `pendingReprocessPasteToken`,
+                    // letting Escape cancel a still-queued paste.
+                    //
+                    // `pendingReprocessClipboardRestore` is also
+                    // stashed on `self` (not just captured locally) so
+                    // `cancelPendingReprocessPaste()` can restore the
+                    // user's real prior clipboard contents if Escape
+                    // cancels before the deferred paste below fires —
+                    // otherwise the clipboard would be left permanently
+                    // overwritten with the reprocessed transcript.
+                    self.lastTranscript = trimmedFinal
+                    let pendingClipboardRestore = self.writeTranscriptToPasteboard(trimmedFinal)
+                    let pasteToken = UUID()
+                    self.pendingReprocessPasteToken = pasteToken
+                    self.pendingReprocessClipboardRestore = pendingClipboardRestore
+                    self.reprocessLastRecordingPhase = .pasteWindowPending
+                    self.performAfterShortcutReleased { [weak self] in
+                        guard let self else { return }
+                        // Safety net: whatever happens below, this
+                        // queued paste always eventually reaches this
+                        // point (see `performAfterShortcutReleased`'s
+                        // bounded retry count), so the busy phase can
+                        // never get stuck. This closure runs entirely
+                        // on the main queue (GCD `asyncAfter`, not a
+                        // Swift Concurrency actor hop), and so does
+                        // `cancelPendingReprocessPaste()` (Escape's
+                        // handler) — main-thread dispatch never
+                        // interleaves the two, so the token check
+                        // immediately below is not merely a check-
+                        // then-act race window like the original
+                        // MainActor-hop defect; whichever of "cancel"
+                        // or "this deferred action" the main queue
+                        // runs first fully completes before the other
+                        // can start.
+                        defer { self.finishPendingReprocessPaste(token: pasteToken) }
+                        // If Escape already invalidated this token (or
+                        // a newer paste superseded it), skip pasting —
+                        // `cancelPendingReprocessPaste()` already
+                        // restored the clipboard in that case.
+                        guard self.pendingReprocessPasteToken == pasteToken else { return }
+                        self.pasteAtCursor()
+                        self.restoreClipboardIfNeeded(pendingClipboardRestore)
+                    }
+                }
+            },
+            applyFailure: { [weak self] payload in
+                guard let self else { return }
+                self.reprocessTask = nil
+                self.reprocessLastRecordingPhase = .idle
+                self.recordReprocessedHistoryEntry(
+                    rawTranscript: "",
+                    postProcessedTranscript: "",
+                    postProcessingPrompt: "",
+                    processingStatus: "Error: \(payload.errorDescription)",
+                    systemPrompt: effectiveReprocessingSystemPrompt,
+                    customVocabulary: capturedCustomVocabulary,
+                    originalItem: originalItem,
+                    processingProfile: resolvedProfile
+                )
+                self.overlayManager.showError("Reprocessing failed: \(payload.errorDescription)")
+            },
+            runOnMainActor: { body in
+                await MainActor.run(body: body)
+            }
+        )
+
+        overlayManager.showTranscribing()
+        let coordinator = ReprocessLastRecordingCoordinator(dependencies: dependencies)
+        reprocessLastRecordingPhase = .taskInFlight
+        reprocessTask = Task {
+            await coordinator.run(audioURL: eligible.audioURL)
+        }
+    }
+
+    /// Clear the pending-paste bookkeeping after a queued reprocessing
+    /// paste actually runs (whether it pasted or was skipped because
+    /// `pendingReprocessPasteToken` no longer matched). Only clears
+    /// when `token` still matches the currently pending token, so a
+    /// stale completion from an already-superseded paste can never
+    /// clobber a NEWER pending paste's busy state.
+    private func finishPendingReprocessPaste(token: UUID) {
+        guard pendingReprocessPasteToken == token else { return }
+        pendingReprocessPasteToken = nil
+        // The clipboard-restore snapshot is no longer needed here:
+        // either the paste above just ran and already called
+        // `restoreClipboardIfNeeded` itself, or `pendingReprocessPasteToken`
+        // no longer matched because `cancelPendingReprocessPaste()`
+        // already restored the clipboard synchronously when Escape
+        // invalidated the token.
+        pendingReprocessClipboardRestore = nil
+        reprocessLastRecordingPhase = .idle
+    }
+
+    /// Append a new linked history row that shares the original
+    /// Physical Recording identity and on-disk WAV with
+    /// `originalItem`, without copying the audio file. Retains the
+    /// original row's intent, selected text, and full context
+    /// snapshot; the transcript, post-processing outcome, processing-
+    /// profile snapshot, `systemPrompt`, and `customVocabulary` all
+    /// reflect what was ACTUALLY used for this reprocessing attempt —
+    /// never `originalItem`'s stored values, which may belong to a
+    /// different attempt with a different profile or vocabulary.
+    ///
+    /// Returns whether the row was actually persisted. Callers MUST
+    /// gate any further paste behavior on this: a linked result that
+    /// failed to save must never be pasted (see `ReprocessSuccessOutcome`).
+    @discardableResult
+    private func recordReprocessedHistoryEntry(
+        rawTranscript: String,
+        postProcessedTranscript: String,
+        postProcessingPrompt: String,
+        processingStatus: String,
+        systemPrompt: String,
+        customVocabulary: String,
+        originalItem: PipelineHistoryItem,
+        processingProfile: ResolvedLanguageProfile
+    ) -> Bool {
+        let newEntry = ReprocessLastRecording.makeLinkedHistoryItem(
+            originalItem: originalItem,
+            processingProfile: processingProfile,
+            rawTranscript: rawTranscript,
+            postProcessedTranscript: postProcessedTranscript,
+            postProcessingPrompt: postProcessingPrompt,
+            systemPrompt: systemPrompt,
+            processingStatus: processingStatus,
+            customVocabulary: customVocabulary
+        )
+        switch ReprocessLastRecording.persistLinkedHistoryItem(
+            newEntry,
+            maxCount: maxPipelineHistoryCount,
+            append: { try self.pipelineHistoryStore.append($0, maxCount: $1) }
+        ) {
+        case .success(let removedAudioFileNames):
+            for audioFileName in removedAudioFileNames {
+                Self.deleteAudioFile(audioFileName)
+            }
+            pipelineHistory = pipelineHistoryStore.loadAllHistory()
+            return true
+        case .failure(let error):
+            errorMessage = "Unable to save reprocessing result: \(error.localizedDescription)"
+            return false
+        }
     }
 
     func toggleRecording() {

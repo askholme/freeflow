@@ -2997,8 +2997,12 @@ struct RunLogEntryView: View {
                             }
                         }
                         .buttonStyle(.plain)
-                        .disabled(isRetrying)
-                        .help("Retry transcription")
+                        .disabled(isRetrying || appState.isReprocessingLastRecordingActive)
+                        .help(
+                            appState.isReprocessingLastRecordingActive
+                                ? "Unavailable while reprocessing the last recording"
+                                : "Retry transcription"
+                        )
                     } else {
                         Color.clear
                             .frame(width: actionIconSize, height: actionIconSize)

@@ -23,6 +23,10 @@ enum ShortcutCoreTests {
         testSwitchLanguageNeverMutatesDictationSession()
         testSwitchLanguageModifierOnlyBindingSideSpecificity()
         testSwitchLanguageExactModifierMatching()
+        testReprocessLastRecordingDisabledByDefault()
+        testReprocessLastRecordingFiresOnLeadingEdgeOnly()
+        testReprocessLastRecordingNeverMutatesDictationSession()
+        testReprocessLastRecordingCollisionDetection()
     }
 
     private static func testBareFnHoldLifecycle() {
@@ -734,5 +738,123 @@ enum ShortcutCoreTests {
             configuration: permittedConfiguration
         )
         TestSupport.expectEqual(permittedKey.emittedEvents, [.switchLanguageTriggered])
+    }
+
+    private static func testReprocessLastRecordingDisabledByDefault() {
+        TestSupport.expect(
+            ShortcutConfiguration.disabled.reprocessLastRecording.isDisabled,
+            "The shared disabled configuration must keep Re-run Last Recording disabled"
+        )
+        TestSupport.expect(
+            ShortcutConfiguration(hold: .defaultHold, toggle: .defaultToggle).reprocessLastRecording.isDisabled,
+            "Re-run Last Recording must default to disabled when a caller omits it, matching Switch Language"
+        )
+    }
+
+    private static func testReprocessLastRecordingFiresOnLeadingEdgeOnly() {
+        let binding = ShortcutBinding(
+            keyCode: 98,
+            keyDisplay: "F7",
+            modifiers: [],
+            kind: .key,
+            preset: nil
+        )
+        let configuration = ShortcutConfiguration(hold: .disabled, toggle: .disabled, reprocessLastRecording: binding)
+        let firstDown = ShortcutMatcher.reduce(
+            state: ShortcutInputState(),
+            event: .keyChanged(keyCode: 98, isDown: true, isRepeat: false),
+            configuration: configuration
+        )
+        let repeated = ShortcutMatcher.reduce(
+            state: firstDown.state,
+            event: .keyChanged(keyCode: 98, isDown: true, isRepeat: true),
+            configuration: configuration
+        )
+        let up = ShortcutMatcher.reduce(
+            state: repeated.state,
+            event: .keyChanged(keyCode: 98, isDown: false, isRepeat: false),
+            configuration: configuration
+        )
+        let secondDown = ShortcutMatcher.reduce(
+            state: up.state,
+            event: .keyChanged(keyCode: 98, isDown: true, isRepeat: false),
+            configuration: configuration
+        )
+
+        TestSupport.expectEqual(firstDown.emittedEvents, [.reprocessLastRecordingTriggered])
+        TestSupport.expectEqual(repeated.emittedEvents, [])
+        TestSupport.expectEqual(up.emittedEvents, [])
+        TestSupport.expectEqual(secondDown.emittedEvents, [.reprocessLastRecordingTriggered])
+    }
+
+    /// The matched `.reprocessLastRecordingTriggered` event must never
+    /// reach the dictation session controller as a start/stop/mode
+    /// action, mirroring `testSwitchLanguageNeverMutatesDictationSession`.
+    private static func testReprocessLastRecordingNeverMutatesDictationSession() {
+        let idleController = DictationShortcutSessionController()
+        TestSupport.expectEqual(
+            idleController.handle(event: .reprocessLastRecordingTriggered, isTranscribing: false),
+            nil
+        )
+
+        let idleWhileTranscribing = DictationShortcutSessionController()
+        TestSupport.expectEqual(
+            idleWhileTranscribing.handle(event: .reprocessLastRecordingTriggered, isTranscribing: true),
+            nil
+        )
+
+        let holdController = DictationShortcutSessionController()
+        _ = holdController.handle(event: .holdActivated, isTranscribing: false)
+        TestSupport.expectEqual(
+            holdController.handle(event: .reprocessLastRecordingTriggered, isTranscribing: false),
+            nil
+        )
+        TestSupport.expectEqual(holdController.activeMode, .hold)
+
+        let toggleController = DictationShortcutSessionController()
+        _ = toggleController.handle(event: .toggleActivated, isTranscribing: false)
+        TestSupport.expectEqual(
+            toggleController.handle(event: .reprocessLastRecordingTriggered, isTranscribing: false),
+            nil
+        )
+        TestSupport.expectEqual(toggleController.activeMode, .toggle)
+    }
+
+    private static func testReprocessLastRecordingCollisionDetection() {
+        let sharedKeyAndModifiers = ShortcutBinding(
+            keyCode: 100,
+            keyDisplay: "F9",
+            modifiers: [.control],
+            kind: .key,
+            preset: nil
+        )
+        let configuration = ShortcutConfiguration(
+            hold: sharedKeyAndModifiers,
+            toggle: sharedKeyAndModifiers,
+            copyAgain: sharedKeyAndModifiers,
+            switchLanguage: sharedKeyAndModifiers,
+            reprocessLastRecording: sharedKeyAndModifiers
+        )
+
+        TestSupport.expect(
+            configuration.reprocessLastRecording.conflicts(with: configuration.hold),
+            "Re-run Last Recording must conflict with an equivalent Hold to Talk binding"
+        )
+        TestSupport.expect(
+            configuration.hold.conflicts(with: configuration.reprocessLastRecording),
+            "Hold to Talk vs Re-run Last Recording conflict detection must be symmetric"
+        )
+        TestSupport.expect(
+            configuration.reprocessLastRecording.conflicts(with: configuration.switchLanguage),
+            "Re-run Last Recording must conflict with an equivalent Switch Language binding"
+        )
+        TestSupport.expect(
+            configuration.switchLanguage.conflicts(with: configuration.reprocessLastRecording),
+            "Switch Language vs Re-run Last Recording conflict detection must be symmetric"
+        )
+        TestSupport.expect(
+            !ShortcutBinding.disabled.conflicts(with: configuration.reprocessLastRecording),
+            "Re-run Last Recording must never conflict with a disabled binding"
+        )
     }
 }

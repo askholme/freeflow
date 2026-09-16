@@ -38,6 +38,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/PipelineHistoryItem.swift \
 	Sources/PipelineHistoryStore.swift \
 	Sources/RealtimeTranscriptionService.swift \
+	Sources/ReprocessLastRecording.swift \
 	Sources/TranscriptTextCore.swift \
 	Sources/UpdateManager.swift \
 	Sources/ShortcutCore/DictationShortcutSessionController.swift \

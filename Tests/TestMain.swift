@@ -15,6 +15,7 @@ struct FreeFlowTests {
         TranscriptTextCoreTests.run()
         LanguageProfileTests.run()
         PhysicalRecordingHistoryTests.run()
+        await ReprocessLastRecordingTests.run()
         print("FreeFlowTests passed")
     }
 }

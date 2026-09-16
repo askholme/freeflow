@@ -11,11 +11,12 @@ final class DictationShortcutSessionController {
     private(set) var toggleStopArmed = false
 
     func handle(event: ShortcutEvent, isTranscribing: Bool) -> DictationShortcutAction? {
-        // Paste Again and Switch Language are handled before this
-        // controller runs; if either ever reaches here, treat it as a
-        // no-op so dictation/recording state is never started, stopped,
-        // or otherwise mutated by a non-dictation shortcut event.
-        if event == .copyAgainTriggered || event == .switchLanguageTriggered { return nil }
+        // Paste Again, Switch Language, and Re-run Last Recording are
+        // handled before this controller runs; if any of them ever
+        // reaches here, treat it as a no-op so dictation/recording
+        // state is never started, stopped, or otherwise mutated by a
+        // non-dictation shortcut event.
+        if event == .copyAgainTriggered || event == .switchLanguageTriggered || event == .reprocessLastRecordingTriggered { return nil }
 
         if activeMode == nil {
             guard !isTranscribing else { return nil }
@@ -30,7 +31,7 @@ final class DictationShortcutSessionController {
                 return .start(.hold)
             case .holdDeactivated, .toggleDeactivated:
                 return nil
-            case .copyAgainTriggered, .switchLanguageTriggered:
+            case .copyAgainTriggered, .switchLanguageTriggered, .reprocessLastRecordingTriggered:
                 return nil
             }
         }
@@ -49,7 +50,7 @@ final class DictationShortcutSessionController {
                 return .stop
             case .holdActivated, .toggleDeactivated:
                 return nil
-            case .copyAgainTriggered, .switchLanguageTriggered:
+            case .copyAgainTriggered, .switchLanguageTriggered, .reprocessLastRecordingTriggered:
                 return nil
             }
 
@@ -64,7 +65,7 @@ final class DictationShortcutSessionController {
                 return .stop
             case .holdActivated, .holdDeactivated:
                 return nil
-            case .copyAgainTriggered, .switchLanguageTriggered:
+            case .copyAgainTriggered, .switchLanguageTriggered, .reprocessLastRecordingTriggered:
                 return nil
             }
         }
