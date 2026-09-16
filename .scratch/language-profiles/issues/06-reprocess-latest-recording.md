@@ -4,7 +4,9 @@ Category: enhancement
 Blocked by: language-profiles/02-manage-language-profiles, language-profiles/04-physical-recording-shared-audio, language-profiles/05-switch-active-profile
 Worker: coding-worker-minimax-m3
 Claimed by: 
-Attempts: 1
+Attempts: 2
+Resume worktree: /tmp/ralph-20260916193458-2197773-06-reprocess-latest-recording
+Resume branch: ralph-run/language-profiles/20260916193458-2197773-06-reprocess-latest-recording
 
 # 06: Reprocess the latest Physical Recording
 
@@ -36,3 +38,8 @@ Attempts: 1
 ## Ralph attempt 1
 
 Blocked at 2026-09-15T16:48:07.443154+00:00: Standards review still requests changes after 3 review rounds (maxReviewRounds reached): AppState's MainActor.run adapters for reprocessing history-append/paste don't recheck Task.isCancelled after the actor hop, so Escape-cancellation could still race a paste or history write through; Spec review approved throughout, but Standards approval was not reached within the allotted rounds.
+
+
+## Ralph attempt 2
+
+Blocked at 2026-09-16T20:34:58.970246+00:00: timed out after 3600s with no final result; check the run log for a blocked permission request
