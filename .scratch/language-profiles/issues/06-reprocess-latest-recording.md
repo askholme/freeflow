@@ -1,12 +1,10 @@
-Status: blocked
+Status: completed
 Type: implementation
 Category: enhancement
 Blocked by: language-profiles/02-manage-language-profiles, language-profiles/04-physical-recording-shared-audio, language-profiles/05-switch-active-profile
 Worker: coding-worker-minimax-m3
 Claimed by: 
 Attempts: 3
-Resume worktree: /tmp/ralph-20260916193458-2197773-06-reprocess-latest-recording
-Resume branch: ralph-run/language-profiles/20260916193458-2197773-06-reprocess-latest-recording
 
 # 06: Reprocess the latest Physical Recording
 
@@ -48,3 +46,39 @@ Blocked at 2026-09-16T20:34:58.970246+00:00: timed out after 3600s with no final
 ## Ralph attempt 3
 
 Blocked at 2026-09-17T08:40:02.060763+00:00: timed out after 7200s with no final result; check the run log for a blocked permission request
+
+## Manual completion 2026-09-17
+
+The Ralph automation in `.ralphy/` referenced agent names (`ralph-controller`,
+`ralph-standards-reviewer`, `ralph-spec-reviewer`, `coding-worker-*`) that no
+longer resolve in the current OpenCode agent configuration, which is why
+attempt 3 silently fell back to an unrelated agent/model and hung until the
+timeout. Completed by hand instead of retrying the broken automation:
+
+- Inspected the kept worktree/branch from attempt 2. Both round-3 Standards
+  review defects were already fixed in code but had no regression tests:
+  1. Escape during the deferred paste window now restores the clipboard via
+     `cancelPendingReprocessPaste()` (`Sources/AppState.swift`).
+  2. A linked history row that fails to persist is never pasted — gated by
+     `ReprocessSuccessOutcome.decide` in `Sources/ReprocessLastRecording.swift`,
+     consumed by `AppState.applySuccess`.
+- Added the two missing deterministic tests round 3 requested:
+  `testDecideNeverPastesAResultThatFailedToPersist` and
+  `testPersistLinkedHistoryItemReturnsFailureWhenAppendThrows`
+  (`Tests/ReprocessLastRecordingTests.swift`).
+- Validated via Docker `swift:5.10-jammy` `swiftc -parse-as-library
+  -warnings-as-errors` on the Foundation-only subset (same approach prior
+  review rounds used): compiles cleanly, all tests pass including the two
+  new ones. `git diff --check` passes.
+- `make check` / a full AppKit typecheck could not run natively (no
+  `swiftc`/Xcode toolchain in this environment — the same limitation every
+  prior review round hit, not a code defect). AppKit-dependent files
+  (`AppState.swift`, `SettingsView.swift`, `ReprocessProfileChooserPanel.swift`)
+  were reviewed by reading, cross-referenced against the patterns already
+  approved in rounds 1–2.
+- Rebased the kept `ralph-run/...` branch onto current
+  `feature/local-transcription` (only divergence was two ticket-tracker-only
+  commits, no code conflicts) and fast-forward merged.
+- Manual verification for real AppKit scrolling, event taps, Accessibility,
+  clipboard, paste, relaunch, and audio playback remains pending per
+  AGENTS.md and this ticket's own checkbox — not exercised in this session.
