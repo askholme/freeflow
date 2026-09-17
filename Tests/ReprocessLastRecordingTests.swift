@@ -27,6 +27,8 @@ enum ReprocessLastRecordingTests {
         testMutualExclusionRejectsHistoryRetryWhileReprocessingActive()
         testReprocessingPhaseStaysBusyThroughPendingPasteAndRejectsRetry()
         testMakeLinkedHistoryItemRecordsValuesActuallyUsedForReprocessing()
+        testDecideNeverPastesAResultThatFailedToPersist()
+        testPersistLinkedHistoryItemReturnsFailureWhenAppendThrows()
 
         await testCoordinatorSuccessAppendsHistoryAndPastes()
         await testCoordinatorNeverSynthesizesReturnEvenWhenTrailingCommandDetected()
@@ -579,6 +581,81 @@ enum ReprocessLastRecordingTests {
         TestSupport.expectEqual(linked.intent, original.intent)
         TestSupport.expectEqual(linked.selectedText, original.selectedText)
         TestSupport.expectEqual(linked.contextSummary, original.contextSummary)
+    }
+
+    // MARK: - Success outcome / history-persistence gating
+
+    /// Regression test for the round-3 reviewed defect: reprocessing
+    /// must never paste a result whose linked history row failed to
+    /// persist — a paste with no retained record misleads the user
+    /// into thinking the alternate-language result was kept.
+    /// `ReprocessSuccessOutcome.decide` is the exact pure function
+    /// `AppState.applySuccess` switches on, so exercising every branch
+    /// here proves production's actual paste/no-paste decision for
+    /// all three outcomes: a failed save (never paste, regardless of
+    /// transcript content), a successful save with nothing to paste
+    /// (empty final transcript), and a successful save with a
+    /// non-empty result (paste).
+    private static func testDecideNeverPastesAResultThatFailedToPersist() {
+        // A failed history save must never be pasted, even with a
+        // non-empty transcript.
+        TestSupport.expectEqual(
+            ReprocessSuccessOutcome.decide(historySaved: false, trimmedFinalTranscript: "some transcript"),
+            .historySaveFailed
+        )
+        // A persisted result with an empty transcript has nothing to
+        // paste.
+        TestSupport.expectEqual(
+            ReprocessSuccessOutcome.decide(historySaved: true, trimmedFinalTranscript: ""),
+            .nothingToPaste
+        )
+        // A persisted result with a non-empty transcript must be
+        // pasted.
+        TestSupport.expectEqual(
+            ReprocessSuccessOutcome.decide(historySaved: true, trimmedFinalTranscript: "some transcript"),
+            .shouldPaste
+        )
+    }
+
+    /// Regression test for the round-3 reviewed defect:
+    /// `AppState.recordReprocessedHistoryEntry` derives the
+    /// `historySaved` flag that gates `ReprocessSuccessOutcome.decide`
+    /// entirely from whether the injected append operation actually
+    /// succeeded — it must never assume success. `persistLinkedHistoryItem`
+    /// is the exact function `recordReprocessedHistoryEntry` calls,
+    /// with the same `(PipelineHistoryItem, Int) throws -> [String]`
+    /// signature `PipelineHistoryStore.append` matches, so a throwing
+    /// mock here proves production correctly detects a failed
+    /// CoreData save (e.g. a full disk or store-loading failure)
+    /// rather than treating it as a retained result.
+    private static func testPersistLinkedHistoryItemReturnsFailureWhenAppendThrows() {
+        struct SyntheticPersistenceError: Error {}
+        let item = makeItem()
+
+        let failureResult = ReprocessLastRecording.persistLinkedHistoryItem(
+            item,
+            maxCount: 200,
+            append: { _, _ in throw SyntheticPersistenceError() }
+        )
+        switch failureResult {
+        case .failure:
+            break
+        case .success:
+            TestSupport.expect(false, "A throwing append operation must surface as a failure, not a success")
+        }
+
+        let removedFileNames = ["synthetic-trimmed.wav"]
+        let successResult = ReprocessLastRecording.persistLinkedHistoryItem(
+            item,
+            maxCount: 200,
+            append: { _, _ in removedFileNames }
+        )
+        switch successResult {
+        case .success(let names):
+            TestSupport.expectEqual(names, removedFileNames)
+        case .failure:
+            TestSupport.expect(false, "A succeeding append operation must surface as a success")
+        }
     }
 
     // MARK: - Coordinator: success / failure / fallback
