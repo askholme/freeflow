@@ -1,10 +1,10 @@
-Status: ready-for-agent
+Status: blocked
 Type: implementation
 Category: enhancement
 Blocked by: language-profiles/02-manage-language-profiles, language-profiles/04-physical-recording-shared-audio, language-profiles/05-switch-active-profile
 Worker: coding-worker-minimax-m3
 Claimed by: 
-Attempts: 2
+Attempts: 3
 Resume worktree: /tmp/ralph-20260916193458-2197773-06-reprocess-latest-recording
 Resume branch: ralph-run/language-profiles/20260916193458-2197773-06-reprocess-latest-recording
 
@@ -43,3 +43,8 @@ Blocked at 2026-09-15T16:48:07.443154+00:00: Standards review still requests cha
 ## Ralph attempt 2
 
 Blocked at 2026-09-16T20:34:58.970246+00:00: timed out after 3600s with no final result; check the run log for a blocked permission request
+
+
+## Ralph attempt 3
+
+Blocked at 2026-09-17T08:40:02.060763+00:00: timed out after 7200s with no final result; check the run log for a blocked permission request
